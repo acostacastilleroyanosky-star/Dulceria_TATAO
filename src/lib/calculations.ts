@@ -1,4 +1,4 @@
-import { Producto, MetaConfig, VentaVale, ProduccionLote, GastoItem, CajaConfig, RepartoSemanal, JustificacionDiferencia } from '../types';
+import { Producto, MetaConfig, VentaVale, ProduccionLote, GastoItem, CajaConfig, RepartoSemanal, JustificacionDiferencia, AlmacenItem, Receta } from '../types';
 
 /**
  * Formats a numeric amount according to locale es-CU with thousands separator and two decimal places.
@@ -592,4 +592,73 @@ export function calculateDailyCashHistory(
       totalGastos: totGastos,
     },
   };
+}
+
+export interface RecetaAgotadoItem {
+  ingredienteId: string;
+  materialId: string;
+  materialNombre: string;
+  motivo: 'agotado' | 'eliminado' | 'subreceta';
+}
+
+/**
+ * Checks whether a recipe references any warehouse material that is out of stock (existencia <= 0)
+ * or missing from warehouse, including nested sub-recipes.
+ */
+export function getRecetaAgotados(
+  receta: Receta,
+  almacen: AlmacenItem[],
+  allRecetas: Receta[] = [],
+  visited: Set<string> = new Set()
+): RecetaAgotadoItem[] {
+  if (visited.has(receta.id)) return [];
+  const nextVisited = new Set(visited);
+  nextVisited.add(receta.id);
+
+  const agotados: RecetaAgotadoItem[] = [];
+
+  (receta.ingredientes || []).forEach((ing) => {
+    if (ing.tipo === 'receta') {
+      const subRec = allRecetas.find((r) => r.id === ing.materialId);
+      if (!subRec) {
+        agotados.push({
+          ingredienteId: ing.id,
+          materialId: ing.materialId,
+          materialNombre: ing.materialNombre,
+          motivo: 'eliminado',
+        });
+      } else if (getRecetaAgotados(subRec, almacen, allRecetas, nextVisited).length > 0) {
+        agotados.push({
+          ingredienteId: ing.id,
+          materialId: ing.materialId,
+          materialNombre: ing.materialNombre,
+          motivo: 'subreceta',
+        });
+      }
+      return;
+    }
+
+    const mat = almacen.find((m) => m.id === ing.materialId);
+    if (!mat) {
+      agotados.push({
+        ingredienteId: ing.id,
+        materialId: ing.materialId,
+        materialNombre: ing.materialNombre,
+        motivo: 'eliminado',
+      });
+    } else if ((Number(mat.existencia) || 0) <= 0) {
+      const label =
+        mat.marca && !ing.materialNombre.includes(mat.marca)
+          ? `${mat.producto} — ${mat.marca}`
+          : ing.materialNombre;
+      agotados.push({
+        ingredienteId: ing.id,
+        materialId: ing.materialId,
+        materialNombre: label,
+        motivo: 'agotado',
+      });
+    }
+  });
+
+  return agotados;
 }

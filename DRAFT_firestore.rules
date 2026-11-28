@@ -1,0 +1,519 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net (Default-Deny Catch-All)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Hardened Global Primitives
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email is string
+        && request.auth.token.email.size() <= 150;
+    }
+
+    function authEmail() {
+      return request.auth.token.email.lower();
+    }
+
+    function authEmailKey() {
+      return request.auth.token.email.lower().replace('[^a-z0-9_-]', '_');
+    }
+
+    // Bootstrapped Primary Admin (zero DB reads)
+    function isPrimaryAdmin() {
+      return isVerifiedUser() && authEmail() == 'acostacastilleroyanosky@gmail.com';
+    }
+
+    function hasActiveRoleDoc() {
+      return exists(/databases/$(database)/documents/email_roles/$(authEmailKey()))
+        && get(/databases/$(database)/documents/email_roles/$(authEmailKey())).data.activo == true;
+    }
+
+    function currentRole() {
+      return get(/databases/$(database)/documents/email_roles/$(authEmailKey())).data.rol;
+    }
+
+    function isAdmin() {
+      return isPrimaryAdmin()
+        || (isVerifiedUser() && hasActiveRoleDoc() && currentRole() == 'Administrador');
+    }
+
+    function isOperator() {
+      return isAdmin()
+        || (isVerifiedUser() && hasActiveRoleDoc() && currentRole() == 'Operador');
+    }
+
+    function isActiveMember() {
+      return isPrimaryAdmin()
+        || (isVerifiedUser() && hasActiveRoleDoc() && currentRole() in ['Administrador', 'Operador', 'Lector']);
+    }
+
+    function isValidAllowedEmails(emails) {
+      return emails is list
+        && emails.size() >= 1
+        && emails.size() <= 20
+        && emails[0] is string
+        && emails[0].size() >= 3
+        && emails[0].size() <= 150;
+    }
+
+    function isOptionalStr(data, key, maxLen) {
+      return !(key in data)
+        || data[key] == null
+        || (data[key] is string && data[key].size() <= maxLen);
+    }
+
+    function isOptionalNum(data, key) {
+      return !(key in data)
+        || data[key] == null
+        || (data[key] is number);
+    }
+
+    function isOptionalBool(data, key) {
+      return !(key in data)
+        || data[key] == null
+        || (data[key] is bool);
+    }
+
+    function canListWorkspaceDoc() {
+      return isVerifiedUser()
+        && (isPrimaryAdmin() || (authEmail() in existing().allowedEmails));
+    }
+
+    function canGetWorkspaceDoc() {
+      return isPrimaryAdmin()
+        || (isActiveMember() && (authEmail() in existing().allowedEmails));
+    }
+
+    // 3. Entity Validation Blueprints
+    function isValidEmailRole(data) {
+      return data.keys().hasAll(['rol', 'activo', 'updatedAt'])
+        && data.keys().hasOnly(['rol', 'activo', 'updatedAt'])
+        && data.rol is string
+        && data.rol.size() <= 20
+        && data.rol in ['Administrador', 'Operador', 'Lector']
+        && data.activo is bool
+        && data.updatedAt == request.time;
+    }
+
+    function isValidUsuarioAutorizado(data, docId) {
+      return data.keys().hasAll(['id', 'email', 'rol', 'fechaAgregado', 'activo', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'email', 'nombre', 'rol', 'fechaAgregado', 'activo', 'updatedAt'])
+        && data.id == docId
+        && isValidId(data.id)
+        && data.email is string
+        && data.email.size() >= 3
+        && data.email.size() <= 150
+        && isOptionalStr(data, 'nombre', 120)
+        && data.rol is string
+        && data.rol.size() <= 20
+        && data.rol in ['Administrador', 'Operador', 'Lector']
+        && data.fechaAgregado is string
+        && data.fechaAgregado.size() <= 30
+        && data.activo is bool
+        && data.updatedAt == request.time;
+    }
+
+    function isValidConfigMeta(data) {
+      return data.keys().hasAll(['siguienteVale', 'periodo', 'pagoPorDulceTrabajador', 'gananciaPorUnidad', 'reparto', 'allowedEmails', 'updatedAt'])
+        && data.keys().hasOnly(['siguienteVale', 'periodo', 'pagoPorDulceTrabajador', 'gananciaPorUnidad', 'reparto', 'allowedEmails', 'updatedAt', 'updatedBy'])
+        && data.siguienteVale is number
+        && data.siguienteVale >= 1
+        && data.periodo is map
+        && data.periodo.keys().hasAll(['desde', 'hasta'])
+        && data.periodo.keys().hasOnly(['desde', 'hasta'])
+        && data.periodo.desde is string && data.periodo.desde.size() <= 20
+        && data.periodo.hasta is string && data.periodo.hasta.size() <= 20
+        && data.pagoPorDulceTrabajador is map
+        && data.gananciaPorUnidad is list
+        && data.gananciaPorUnidad.size() <= 200
+        && (data.gananciaPorUnidad.size() == 0 || data.gananciaPorUnidad[0] is map)
+        && data.reparto is map
+        && data.reparto.keys().hasAll(['fondoPct', 'administradorPct', 'duenos'])
+        && data.reparto.keys().hasOnly(['fondoPct', 'administradorPct', 'duenos'])
+        && data.reparto.fondoPct is number
+        && data.reparto.administradorPct is number
+        && data.reparto.duenos is list
+        && data.reparto.duenos.size() <= 10
+        && (data.reparto.duenos.size() == 0 || (data.reparto.duenos[0] is string && data.reparto.duenos[0].size() <= 80))
+        && isValidAllowedEmails(data.allowedEmails)
+        && isOptionalStr(data, 'updatedBy', 150)
+        && data.updatedAt == request.time;
+    }
+
+    function isValidConfigCaja(data) {
+      return data.keys().hasAll(['saldoInicial', 'fechaInicio', 'allowedEmails', 'updatedAt'])
+        && data.keys().hasOnly(['saldoInicial', 'fechaInicio', 'allowedEmails', 'updatedAt', 'updatedBy'])
+        && data.saldoInicial is number
+        && data.fechaInicio is string
+        && data.fechaInicio.size() <= 20
+        && isValidAllowedEmails(data.allowedEmails)
+        && isOptionalStr(data, 'updatedBy', 150)
+        && data.updatedAt == request.time;
+    }
+
+    function isValidReparto(data, docId) {
+      return data.keys().hasAll(['id', 'desde', 'hasta', 'ganancia', 'administrador', 'tatao', 'carlos', 'estado', 'allowedEmails', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'desde', 'hasta', 'ganancia', 'administrador', 'tatao', 'carlos', 'fechaPago', 'estado', 'allowedEmails', 'updatedAt'])
+        && data.id == docId
+        && isValidId(data.id)
+        && data.desde is string && data.desde.size() <= 20
+        && data.hasta is string && data.hasta.size() <= 20
+        && data.ganancia is number
+        && data.administrador is number
+        && data.tatao is number
+        && data.carlos is number
+        && isOptionalStr(data, 'fechaPago', 20)
+        && data.estado is string && data.estado.size() <= 20
+        && data.estado in ['Pagado', 'Pendiente']
+        && isValidAllowedEmails(data.allowedEmails)
+        && data.updatedAt == request.time;
+    }
+
+    function isValidCliente(data, docId) {
+      return data.keys().hasAll(['id', 'nombre', 'telefono', 'allowedEmails', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'nombre', 'telefono', 'email', 'ci', 'direccion', 'allowedEmails', 'updatedAt'])
+        && data.id == docId
+        && isValidId(data.id)
+        && data.nombre is string && data.nombre.size() >= 1 && data.nombre.size() <= 150
+        && data.telefono is string && data.telefono.size() <= 50
+        && isOptionalStr(data, 'email', 150)
+        && isOptionalStr(data, 'ci', 50)
+        && isOptionalStr(data, 'direccion', 300)
+        && isValidAllowedEmails(data.allowedEmails)
+        && data.updatedAt == request.time;
+    }
+
+    function isValidProducto(data, docId) {
+      return data.keys().hasAll(['id', 'nombre', 'precioVigente', 'historicoPrecios', 'allowedEmails', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'nombre', 'costoUnitario', 'precioVigente', 'historicoPrecios', 'activo', 'allowedEmails', 'updatedAt'])
+        && data.id == docId
+        && isValidId(data.id)
+        && data.nombre is string && data.nombre.size() >= 1 && data.nombre.size() <= 120
+        && isOptionalNum(data, 'costoUnitario')
+        && data.precioVigente is number && data.precioVigente >= 0
+        && data.historicoPrecios is list && data.historicoPrecios.size() <= 100
+        && (data.historicoPrecios.size() == 0 || data.historicoPrecios[0] is map)
+        && isOptionalBool(data, 'activo')
+        && isValidAllowedEmails(data.allowedEmails)
+        && data.updatedAt == request.time;
+    }
+
+    function isValidProduccion(data, docId) {
+      return data.keys().hasAll(['id', 'fecha', 'producto', 'cantidad', 'merma', 'costo', 'allowedEmails', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'fecha', 'producto', 'cantidad', 'merma', 'costo', 'allowedEmails', 'updatedAt'])
+        && data.id == docId
+        && isValidId(data.id)
+        && data.fecha is string && data.fecha.size() <= 20
+        && data.producto is string && data.producto.size() >= 1 && data.producto.size() <= 120
+        && data.cantidad is number && data.cantidad >= 0
+        && data.merma is number && data.merma >= 0
+        && data.costo is number && data.costo >= 0
+        && isValidAllowedEmails(data.allowedEmails)
+        && data.updatedAt == request.time;
+    }
+
+    function isValidVenta(data, docId) {
+      return data.keys().hasAll(['id', 'vale', 'fecha', 'cliente', 'lineas', 'importeTotal', 'allowedEmails', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'vale', 'fecha', 'cliente', 'lineas', 'importeTotal', 'formaPago', 'nota', 'allowedEmails', 'updatedAt'])
+        && data.id == docId
+        && isValidId(data.id)
+        && data.vale is string && data.vale.size() >= 1 && data.vale.size() <= 40
+        && data.fecha is string && data.fecha.size() <= 20
+        && data.cliente is string && data.cliente.size() >= 1 && data.cliente.size() <= 150
+        && data.lineas is list && data.lineas.size() >= 1 && data.lineas.size() <= 50 && data.lineas[0] is map
+        && data.importeTotal is number && data.importeTotal >= 0
+        && isOptionalStr(data, 'formaPago', 30)
+        && isOptionalStr(data, 'nota', 500)
+        && isValidAllowedEmails(data.allowedEmails)
+        && data.updatedAt == request.time;
+    }
+
+    function isValidGasto(data, docId) {
+      return data.keys().hasAll(['id', 'fecha', 'categoria', 'concepto', 'importe', 'formaPago', 'allowedEmails', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'fecha', 'categoria', 'concepto', 'importe', 'formaPago', 'tipoSalario', 'loteId', 'repartoId', 'generadoPor', 'allowedEmails', 'updatedAt'])
+        && data.id == docId
+        && isValidId(data.id)
+        && data.fecha is string && data.fecha.size() <= 20
+        && data.categoria is string && data.categoria.size() <= 50
+        && data.concepto is string && data.concepto.size() <= 250
+        && data.importe is number && data.importe >= 0
+        && data.formaPago is string && data.formaPago.size() <= 40
+        && isOptionalStr(data, 'tipoSalario', 30)
+        && isOptionalStr(data, 'loteId', 128)
+        && isOptionalStr(data, 'repartoId', 128)
+        && isOptionalStr(data, 'generadoPor', 30)
+        && isValidAllowedEmails(data.allowedEmails)
+        && data.updatedAt == request.time;
+    }
+
+    function isValidAlmacen(data, docId) {
+      return data.keys().hasAll(['id', 'codigo', 'producto', 'unidad', 'existencia', 'precio', 'fechaConteo', 'movimientos', 'allowedEmails', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'codigo', 'producto', 'marca', 'presentacion', 'unidad', 'existencia', 'precio', 'contenidoTotal', 'fechaConteo', 'stockMinimo', 'movimientos', 'allowedEmails', 'updatedAt'])
+        && data.id == docId
+        && isValidId(data.id)
+        && data.codigo is string && data.codigo.size() <= 40
+        && data.producto is string && data.producto.size() >= 1 && data.producto.size() <= 150
+        && isOptionalStr(data, 'marca', 120)
+        && isOptionalStr(data, 'presentacion', 120)
+        && data.unidad is string && data.unidad.size() <= 40
+        && data.existencia is number && data.existencia >= 0
+        && data.precio is number && data.precio >= 0
+        && isOptionalNum(data, 'contenidoTotal')
+        && data.fechaConteo is string && data.fechaConteo.size() <= 20
+        && isOptionalNum(data, 'stockMinimo')
+        && data.movimientos is list && data.movimientos.size() <= 500
+        && (data.movimientos.size() == 0 || data.movimientos[0] is map)
+        && isValidAllowedEmails(data.allowedEmails)
+        && data.updatedAt == request.time;
+    }
+
+    function isValidFactura(data, docId) {
+      return data.keys().hasAll(['id', 'numero', 'cliente', 'telefono', 'ci', 'direccion', 'fecha', 'periodoVales', 'valesIncluidos', 'valesDetalle', 'productosConsolidados', 'importeTotal', 'allowedEmails', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'numero', 'cliente', 'telefono', 'ci', 'direccion', 'fecha', 'periodoVales', 'valesIncluidos', 'valesDetalle', 'productosConsolidados', 'importeTotal', 'observaciones', 'allowedEmails', 'updatedAt'])
+        && data.id == docId
+        && isValidId(data.id)
+        && data.numero is string && data.numero.size() <= 40
+        && data.cliente is string && data.cliente.size() <= 150
+        && data.telefono is string && data.telefono.size() <= 50
+        && data.ci is string && data.ci.size() <= 50
+        && data.direccion is string && data.direccion.size() <= 300
+        && data.fecha is string && data.fecha.size() <= 20
+        && data.periodoVales is string && data.periodoVales.size() <= 80
+        && data.valesIncluidos is list && data.valesIncluidos.size() <= 200
+        && (data.valesIncluidos.size() == 0 || (data.valesIncluidos[0] is string && data.valesIncluidos[0].size() <= 128))
+        && data.valesDetalle is list && data.valesDetalle.size() <= 200
+        && (data.valesDetalle.size() == 0 || data.valesDetalle[0] is map)
+        && data.productosConsolidados is list && data.productosConsolidados.size() <= 200
+        && (data.productosConsolidados.size() == 0 || data.productosConsolidados[0] is map)
+        && data.importeTotal is number && data.importeTotal >= 0
+        && isOptionalStr(data, 'observaciones', 500)
+        && isValidAllowedEmails(data.allowedEmails)
+        && data.updatedAt == request.time;
+    }
+
+    function isValidJustificacion(data, docId) {
+      return data.keys().hasAll(['id', 'fecha', 'nota', 'fechaRegistro', 'allowedEmails', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'fecha', 'producto', 'nota', 'fechaRegistro', 'allowedEmails', 'updatedAt'])
+        && data.id == docId
+        && isValidId(data.id)
+        && data.fecha is string && data.fecha.size() <= 20
+        && isOptionalStr(data, 'producto', 120)
+        && data.nota is string && data.nota.size() <= 1000
+        && data.fechaRegistro is string && data.fechaRegistro.size() <= 40
+        && isValidAllowedEmails(data.allowedEmails)
+        && data.updatedAt == request.time;
+    }
+
+    function isValidReceta(data, docId) {
+      return data.keys().hasAll(['id', 'nombre', 'ingredientes', 'costoTotal', 'allowedEmails', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'nombre', 'ingredientes', 'costoIngredientes', 'unidadesRinde', 'porcentajeAdicionalCostos', 'porcentajeBeneficioEsperado', 'costoTotal', 'costoUnitario', 'precioSugeridoUnitario', 'fechaCreacion', 'observaciones', 'notas', 'allowedEmails', 'updatedAt'])
+        && data.id == docId
+        && isValidId(data.id)
+        && data.nombre is string && data.nombre.size() >= 1 && data.nombre.size() <= 150
+        && data.ingredientes is list && data.ingredientes.size() <= 100
+        && (data.ingredientes.size() == 0 || data.ingredientes[0] is map)
+        && isOptionalNum(data, 'costoIngredientes')
+        && isOptionalNum(data, 'unidadesRinde')
+        && isOptionalNum(data, 'porcentajeAdicionalCostos')
+        && isOptionalNum(data, 'porcentajeBeneficioEsperado')
+        && data.costoTotal is number && data.costoTotal >= 0
+        && isOptionalNum(data, 'costoUnitario')
+        && isOptionalNum(data, 'precioSugeridoUnitario')
+        && isOptionalStr(data, 'fechaCreacion', 40)
+        && isOptionalStr(data, 'observaciones', 1000)
+        && isOptionalStr(data, 'notas', 1000)
+        && isValidAllowedEmails(data.allowedEmails)
+        && data.updatedAt == request.time;
+    }
+
+    // 4. Collection Rules
+    match /test/{docId} {
+      allow get: if isVerifiedUser() && docId == 'connection';
+    }
+
+    // PII-free email role lookup (admin writes, user can read only own role key)
+    match /email_roles/{emailKey} {
+      allow get: if isVerifiedUser() && isValidId(emailKey) && (isAdmin() || emailKey == authEmailKey());
+      allow list: if isPrimaryAdmin();
+      allow create: if isAdmin() && isValidId(emailKey) && isValidEmailRole(incoming());
+      allow update: if isAdmin() && isValidId(emailKey) && isValidEmailRole(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['rol', 'activo', 'updatedAt']);
+      allow delete: if isAdmin() && isValidId(emailKey);
+    }
+
+    // Admin-only authorized users directory (contains email PII)
+    match /usuarios_autorizados/{usuarioId} {
+      allow get: if isAdmin() && isValidId(usuarioId);
+      allow list: if isPrimaryAdmin();
+      allow create: if isAdmin() && isValidId(usuarioId) && isValidUsuarioAutorizado(incoming(), usuarioId);
+      allow update: if isAdmin() && isValidId(usuarioId) && isValidUsuarioAutorizado(incoming(), usuarioId)
+        && incoming().id == existing().id
+        && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'nombre', 'rol', 'fechaAgregado', 'activo', 'updatedAt']);
+      allow delete: if isAdmin() && isValidId(usuarioId);
+    }
+
+    // Global Config: meta & caja
+    match /config/meta {
+      allow get: if canGetWorkspaceDoc();
+      allow create: if isAdmin() && isValidConfigMeta(incoming());
+      allow update: if isValidConfigMeta(incoming()) && (
+        (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['siguienteVale', 'periodo', 'pagoPorDulceTrabajador', 'gananciaPorUnidad', 'reparto', 'allowedEmails', 'updatedAt', 'updatedBy']))
+        || (isOperator() && incoming().diff(existing()).affectedKeys().hasOnly(['siguienteVale', 'updatedAt', 'updatedBy']))
+      );
+      allow delete: if false;
+    }
+
+    match /config/caja {
+      allow get: if canGetWorkspaceDoc();
+      allow create: if isAdmin() && isValidConfigCaja(incoming());
+      allow update: if isAdmin() && isValidConfigCaja(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['saldoInicial', 'fechaInicio', 'allowedEmails', 'updatedAt', 'updatedBy']);
+      allow delete: if false;
+    }
+
+    match /repartos/{repartoId} {
+      allow get: if isValidId(repartoId) && canGetWorkspaceDoc();
+      allow list: if canListWorkspaceDoc();
+      allow create: if isAdmin() && isValidId(repartoId) && isValidReparto(incoming(), repartoId);
+      allow update: if isAdmin() && isValidId(repartoId) && isValidReparto(incoming(), repartoId)
+        && incoming().id == existing().id
+        && incoming().diff(existing()).affectedKeys().hasOnly(['desde', 'hasta', 'ganancia', 'administrador', 'tatao', 'carlos', 'fechaPago', 'estado', 'allowedEmails', 'updatedAt']);
+      allow delete: if isAdmin() && isValidId(repartoId);
+    }
+
+    match /clientes/{clienteId} {
+      allow get: if isValidId(clienteId) && canGetWorkspaceDoc();
+      allow list: if canListWorkspaceDoc();
+      allow create: if isOperator() && isValidId(clienteId) && isValidCliente(incoming(), clienteId);
+      allow update: if isOperator() && isValidId(clienteId) && isValidCliente(incoming(), clienteId)
+        && incoming().id == existing().id
+        && (
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['nombre', 'telefono', 'email', 'ci', 'direccion', 'allowedEmails', 'updatedAt']))
+          || (incoming().diff(existing()).affectedKeys().hasOnly(['nombre', 'telefono', 'email', 'ci', 'direccion', 'updatedAt']))
+        );
+      allow delete: if isOperator() && isValidId(clienteId);
+    }
+
+    match /productos/{productoId} {
+      allow get: if isValidId(productoId) && canGetWorkspaceDoc();
+      allow list: if canListWorkspaceDoc();
+      allow create: if isOperator() && isValidId(productoId) && isValidProducto(incoming(), productoId);
+      allow update: if isOperator() && isValidId(productoId) && isValidProducto(incoming(), productoId)
+        && incoming().id == existing().id
+        && (
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['nombre', 'costoUnitario', 'precioVigente', 'historicoPrecios', 'activo', 'allowedEmails', 'updatedAt']))
+          || (incoming().diff(existing()).affectedKeys().hasOnly(['nombre', 'costoUnitario', 'precioVigente', 'historicoPrecios', 'activo', 'updatedAt']))
+        );
+      allow delete: if isAdmin() && isValidId(productoId);
+    }
+
+    match /produccion/{loteId} {
+      allow get: if isValidId(loteId) && canGetWorkspaceDoc();
+      allow list: if canListWorkspaceDoc();
+      allow create: if isOperator() && isValidId(loteId) && isValidProduccion(incoming(), loteId);
+      allow update: if isOperator() && isValidId(loteId) && isValidProduccion(incoming(), loteId)
+        && incoming().id == existing().id
+        && (
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['fecha', 'producto', 'cantidad', 'merma', 'costo', 'allowedEmails', 'updatedAt']))
+          || (incoming().diff(existing()).affectedKeys().hasOnly(['fecha', 'producto', 'cantidad', 'merma', 'costo', 'updatedAt']))
+        );
+      allow delete: if isOperator() && isValidId(loteId);
+    }
+
+    match /ventas/{ventaId} {
+      allow get: if isValidId(ventaId) && canGetWorkspaceDoc();
+      allow list: if canListWorkspaceDoc();
+      allow create: if isOperator() && isValidId(ventaId) && isValidVenta(incoming(), ventaId);
+      allow update: if isOperator() && isValidId(ventaId) && isValidVenta(incoming(), ventaId)
+        && incoming().id == existing().id
+        && (
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['vale', 'fecha', 'cliente', 'lineas', 'importeTotal', 'formaPago', 'nota', 'allowedEmails', 'updatedAt']))
+          || (incoming().diff(existing()).affectedKeys().hasOnly(['vale', 'fecha', 'cliente', 'lineas', 'importeTotal', 'formaPago', 'nota', 'updatedAt']))
+        );
+      allow delete: if isOperator() && isValidId(ventaId);
+    }
+
+    match /gastos/{gastoId} {
+      allow get: if isValidId(gastoId) && canGetWorkspaceDoc();
+      allow list: if canListWorkspaceDoc();
+      allow create: if isOperator() && isValidId(gastoId) && isValidGasto(incoming(), gastoId);
+      allow update: if isOperator() && isValidId(gastoId) && isValidGasto(incoming(), gastoId)
+        && incoming().id == existing().id
+        && (
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['fecha', 'categoria', 'concepto', 'importe', 'formaPago', 'tipoSalario', 'loteId', 'repartoId', 'generadoPor', 'allowedEmails', 'updatedAt']))
+          || (incoming().diff(existing()).affectedKeys().hasOnly(['fecha', 'categoria', 'concepto', 'importe', 'formaPago', 'tipoSalario', 'loteId', 'repartoId', 'generadoPor', 'updatedAt']))
+        );
+      allow delete: if isOperator() && isValidId(gastoId);
+    }
+
+    match /almacen/{itemId} {
+      allow get: if isValidId(itemId) && canGetWorkspaceDoc();
+      allow list: if canListWorkspaceDoc();
+      allow create: if isOperator() && isValidId(itemId) && isValidAlmacen(incoming(), itemId);
+      allow update: if isOperator() && isValidId(itemId) && isValidAlmacen(incoming(), itemId)
+        && incoming().id == existing().id
+        && (
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['codigo', 'producto', 'marca', 'presentacion', 'unidad', 'existencia', 'precio', 'contenidoTotal', 'fechaConteo', 'stockMinimo', 'movimientos', 'allowedEmails', 'updatedAt']))
+          || (incoming().diff(existing()).affectedKeys().hasOnly(['codigo', 'producto', 'marca', 'presentacion', 'unidad', 'existencia', 'precio', 'contenidoTotal', 'fechaConteo', 'stockMinimo', 'movimientos', 'updatedAt']))
+        );
+      allow delete: if isOperator() && isValidId(itemId);
+    }
+
+    match /facturas/{facturaId} {
+      allow get: if isValidId(facturaId) && canGetWorkspaceDoc();
+      allow list: if canListWorkspaceDoc();
+      allow create: if isOperator() && isValidId(facturaId) && isValidFactura(incoming(), facturaId);
+      allow update: if isAdmin() && isValidId(facturaId) && isValidFactura(incoming(), facturaId)
+        && incoming().id == existing().id
+        && incoming().diff(existing()).affectedKeys().hasOnly(['numero', 'cliente', 'telefono', 'ci', 'direccion', 'fecha', 'periodoVales', 'valesIncluidos', 'valesDetalle', 'productosConsolidados', 'importeTotal', 'observaciones', 'allowedEmails', 'updatedAt']);
+      allow delete: if isOperator() && isValidId(facturaId);
+    }
+
+    match /justificaciones/{justificacionId} {
+      allow get: if isValidId(justificacionId) && canGetWorkspaceDoc();
+      allow list: if canListWorkspaceDoc();
+      allow create: if isOperator() && isValidId(justificacionId) && isValidJustificacion(incoming(), justificacionId);
+      allow update: if isOperator() && isValidId(justificacionId) && isValidJustificacion(incoming(), justificacionId)
+        && incoming().id == existing().id
+        && (
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['fecha', 'producto', 'nota', 'fechaRegistro', 'allowedEmails', 'updatedAt']))
+          || (incoming().diff(existing()).affectedKeys().hasOnly(['fecha', 'producto', 'nota', 'fechaRegistro', 'updatedAt']))
+        );
+      allow delete: if isOperator() && isValidId(justificacionId);
+    }
+
+    match /recetas/{recetaId} {
+      allow get: if isValidId(recetaId) && canGetWorkspaceDoc();
+      allow list: if canListWorkspaceDoc();
+      allow create: if isOperator() && isValidId(recetaId) && isValidReceta(incoming(), recetaId);
+      allow update: if isOperator() && isValidId(recetaId) && isValidReceta(incoming(), recetaId)
+        && incoming().id == existing().id
+        && (
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['nombre', 'ingredientes', 'costoIngredientes', 'unidadesRinde', 'porcentajeAdicionalCostos', 'porcentajeBeneficioEsperado', 'costoTotal', 'costoUnitario', 'precioSugeridoUnitario', 'fechaCreacion', 'observaciones', 'notas', 'allowedEmails', 'updatedAt']))
+          || (incoming().diff(existing()).affectedKeys().hasOnly(['nombre', 'ingredientes', 'costoIngredientes', 'unidadesRinde', 'porcentajeAdicionalCostos', 'porcentajeBeneficioEsperado', 'costoTotal', 'costoUnitario', 'precioSugeridoUnitario', 'fechaCreacion', 'observaciones', 'notas', 'updatedAt']))
+        );
+      allow delete: if isOperator() && isValidId(recetaId);
+    }
+  }
+}

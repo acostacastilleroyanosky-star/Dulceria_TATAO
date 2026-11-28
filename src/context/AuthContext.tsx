@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef, ReactNode } from 'react';
 import {
   User,
   signInWithPopup,
@@ -21,6 +21,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const [user, setUser] = useState<User | null>(null);
   const [token, setToken] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
+  const pendingSignInRef = useRef<Promise<void> | null>(null);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
@@ -29,17 +30,8 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         try {
           const idToken = await currentUser.getIdToken();
           setToken(idToken);
-
-          // Synchronize user profile into PostgreSQL
-          await fetch('/api/auth/sync-user', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${idToken}`,
-            },
-          });
         } catch (error) {
-          console.error('Error syncing user with backend:', error);
+          console.error('Error getting auth token:', error);
         }
       } else {
         setToken(null);
@@ -51,14 +43,25 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   }, []);
 
   const signInWithGoogle = async () => {
-    try {
-      const result = await signInWithPopup(auth, googleAuthProvider);
-      const idToken = await result.user.getIdToken();
-      setToken(idToken);
-    } catch (error) {
-      console.error('Error signing in with Google:', error);
-      throw error;
+    if (pendingSignInRef.current) {
+      return pendingSignInRef.current;
     }
+
+    const promise = (async () => {
+      try {
+        const result = await signInWithPopup(auth, googleAuthProvider);
+        const idToken = await result.user.getIdToken();
+        setToken(idToken);
+      } catch (error) {
+        console.error('Error signing in with Google:', error);
+        throw error;
+      } finally {
+        pendingSignInRef.current = null;
+      }
+    })();
+
+    pendingSignInRef.current = promise;
+    return promise;
   };
 
   const signOut = async () => {

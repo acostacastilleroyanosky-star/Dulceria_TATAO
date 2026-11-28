@@ -19,7 +19,6 @@ import {
   ChevronRight,
   BookOpen,
   UserCheck,
-  Sparkles,
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -37,7 +36,6 @@ const PRIMARY_MENU_ITEMS: MenuItem[] = [
   { name: 'Producción', icon: Factory },
   { name: 'Ventas', icon: ShoppingCart },
   { name: 'Facturación', icon: FileText },
-  { name: 'Reportes', icon: Sparkles },
   { name: 'Gastos', icon: CreditCard },
   { name: 'Caja', icon: Landmark },
   { name: 'Almacén', icon: Package },
@@ -46,7 +44,7 @@ const PRIMARY_MENU_ITEMS: MenuItem[] = [
 ];
 
 export const Sidebar: React.FC<SidebarProps> = ({ isOpenMobile, onCloseMobile }) => {
-  const { currentModule, setCurrentModule, pendingAlertsCount } = useApp();
+  const { currentModule, setCurrentModule, pendingAlertsCount, pendingRepartosCount, outOfStockRecetasCount } = useApp();
 
   // Track expanded state of collapsible menus
   const isProductosActive =
@@ -127,18 +125,31 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpenMobile, onCloseMobile })
                 key={item.name}
                 type="button"
                 onClick={() => handleSelect(item.name)}
-                className={`w-full flex items-center gap-3 px-3 py-2 text-xs font-medium rounded-md transition-colors ${
+                className={`w-full flex items-center justify-between gap-2 px-3 py-2 text-xs font-medium rounded-md transition-colors ${
                   isActive
                     ? 'bg-amber-500 text-slate-950 font-semibold shadow-xs'
                     : 'text-slate-300 hover:bg-slate-800 hover:text-white'
                 }`}
               >
-                <Icon
-                  className={`w-4 h-4 shrink-0 ${
-                    isActive ? 'text-slate-950' : 'text-slate-400'
-                  }`}
-                />
-                <span className="truncate">{item.name}</span>
+                <div className="flex items-center gap-3 min-w-0">
+                  <Icon
+                    className={`w-4 h-4 shrink-0 ${
+                      isActive ? 'text-slate-950' : 'text-slate-400'
+                    }`}
+                  />
+                  <span className="truncate">{item.name}</span>
+                </div>
+                {item.name === 'Caja' && pendingRepartosCount > 0 && (
+                  <span
+                    className={`px-1.5 py-0.2 rounded-full text-[10px] font-bold shrink-0 ${
+                      isActive
+                        ? 'bg-slate-950 text-amber-400'
+                        : 'bg-amber-500 text-slate-950 animate-pulse'
+                    }`}
+                  >
+                    {pendingRepartosCount}
+                  </span>
+                )}
               </button>
             );
           })}
@@ -171,11 +182,18 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpenMobile, onCloseMobile })
                 />
                 <span className="truncate">Productos</span>
               </div>
-              {isProductosOpen ? (
-                <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
-              ) : (
-                <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
-              )}
+              <div className="flex items-center gap-1.5">
+                {outOfStockRecetasCount > 0 && !isProductosOpen && (
+                  <span className="px-1.5 py-0.2 rounded-full text-[10px] font-bold bg-rose-500 text-white animate-pulse">
+                    {outOfStockRecetasCount}
+                  </span>
+                )}
+                {isProductosOpen ? (
+                  <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                ) : (
+                  <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
+                )}
+              </div>
             </button>
 
             {/* Submenús de Productos */}
@@ -197,14 +215,27 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpenMobile, onCloseMobile })
                 <button
                   type="button"
                   onClick={() => handleSelect('Recetas')}
-                  className={`w-full flex items-center gap-2.5 px-2.5 py-1.5 text-xs rounded-md transition-colors ${
+                  className={`w-full flex items-center justify-between px-2.5 py-1.5 text-xs rounded-md transition-colors ${
                     currentModule === 'Recetas'
                       ? 'bg-amber-500 text-slate-950 font-semibold shadow-xs'
                       : 'text-slate-300 hover:bg-slate-800 hover:text-white'
                   }`}
                 >
-                  <BookOpen className="w-3.5 h-3.5 shrink-0" />
-                  <span>Recetas</span>
+                  <div className="flex items-center gap-2.5">
+                    <BookOpen className="w-3.5 h-3.5 shrink-0" />
+                    <span>Recetas</span>
+                  </div>
+                  {outOfStockRecetasCount > 0 && (
+                    <span
+                      className={`px-1.5 py-0.2 rounded-full text-[10px] font-bold ${
+                        currentModule === 'Recetas'
+                          ? 'bg-slate-950 text-rose-400'
+                          : 'bg-rose-500 text-white animate-pulse'
+                      }`}
+                    >
+                      {outOfStockRecetasCount}
+                    </span>
+                  )}
                 </button>
               </div>
             )}

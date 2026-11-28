@@ -63,7 +63,7 @@ export const SyncNotification: React.FC = () => {
             <div className="text-xs text-gray-700 leading-relaxed bg-amber-50/70 p-3.5 rounded-xl border border-amber-200/70 space-y-2">
               <p>
                 En <strong className="text-amber-900 font-bold">{autoSyncWarning.secondsLeft} segundos</strong>{' '}
-                se actualizarán automáticamente los datos con <strong>Cloud SQL (PostgreSQL)</strong> para
+                se actualizarán automáticamente los datos con <strong>Firebase Firestore</strong> para
                 mantener sincronizados todos los dispositivos y la web.
               </p>
               <p className="text-gray-600 text-[11px]">

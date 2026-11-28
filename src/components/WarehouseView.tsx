@@ -7,6 +7,45 @@ import { ConfirmModal } from './ConfirmModal';
 import { useEscToClose } from '../hooks/useEscToClose';
 import { Plus, Minus, FileText, Edit2, Trash2, RotateCcw } from 'lucide-react';
 
+// Extrae factor numérico y unidad de medida desde el texto de Presentación (ej. "Sacos de 25 kg" -> { factor: 25, unidad: "kg" })
+function parsePresentacion(presentacion: string): {
+  factor: number;
+  unidad: string;
+  hasParsedFactorAndUnit: boolean;
+} {
+  const text = presentacion.trim();
+  if (!text) {
+    return { factor: 1, unidad: 'u', hasParsedFactorAndUnit: false };
+  }
+
+  const matches = [...text.matchAll(/(\d+(?:[.,]\d+)?)\s*([a-zA-ZáéíóúÁÉÍÓÚñÑüÜ]+)?/g)];
+  const withUnit = [...matches].reverse().find((m) => m[2] && m[2].trim().length > 0);
+  const chosen = withUnit || matches[matches.length - 1];
+
+  if (chosen) {
+    const num = parseFloat(chosen[1].replace(',', '.'));
+    const factor = !isNaN(num) && num > 0 ? num : 1;
+    const rawUnit = (chosen[2] || '').trim();
+    const unidad = rawUnit || text;
+    return {
+      factor,
+      unidad,
+      hasParsedFactorAndUnit: Boolean(withUnit && !isNaN(num) && num > 0),
+    };
+  }
+
+  return { factor: 1, unidad: text, hasParsedFactorAndUnit: false };
+}
+
+function getItemPresentacionFactor(item: AlmacenItem): number {
+  if (item.contenidoTotal && item.contenidoTotal > 0) return item.contenidoTotal;
+  if (item.presentacion) {
+    const parsed = parsePresentacion(item.presentacion);
+    if (parsed.hasParsedFactorAndUnit) return parsed.factor;
+  }
+  return 1;
+}
+
 export const WarehouseView: React.FC = () => {
   const {
     data,
@@ -22,11 +61,9 @@ export const WarehouseView: React.FC = () => {
   const [newProducto, setNewProducto] = useState<string>('');
   const [newMarca, setNewMarca] = useState<string>('');
   const [newPresentacion, setNewPresentacion] = useState<string>('');
-  const [newUnidad, setNewUnidad] = useState<string>('kg');
-  const [newExistencia, setNewExistencia] = useState<string>('0');
-  const [newPrecio, setNewPrecio] = useState<string>('0');
-  const [newFechaConteo, setNewFechaConteo] = useState<string>(toISODate(new Date()));
-  const [newStockMinimo, setNewStockMinimo] = useState<string>('');
+  const [newCantidad, setNewCantidad] = useState<string>('');
+  const [newPrecio, setNewPrecio] = useState<string>('');
+  const [newFechaEntrada, setNewFechaEntrada] = useState<string>(toISODate(new Date()));
 
   // Edit item modal
   const [editingItem, setEditingItem] = useState<AlmacenItem | null>(null);
@@ -34,8 +71,9 @@ export const WarehouseView: React.FC = () => {
   const [editMarca, setEditMarca] = useState<string>('');
   const [editPresentacion, setEditPresentacion] = useState<string>('');
   const [editUnidad, setEditUnidad] = useState<string>('');
+  const [editCantidad, setEditCantidad] = useState<string>('0');
   const [editPrecio, setEditPrecio] = useState<string>('0');
-  const [editStockMinimo, setEditStockMinimo] = useState<string>('');
+  const [editFechaEntrada, setEditFechaEntrada] = useState<string>(toISODate(new Date()));
 
   // Quick movement modal (+ Entrada / − Salida)
   const [movementModal, setMovementModal] = useState<{
@@ -60,64 +98,113 @@ export const WarehouseView: React.FC = () => {
     else if (isNewModalOpen) setIsNewModalOpen(false);
   });
 
-  // Auto-calculated next code
-  const nextCode = `MP-${String(data.almacen.length + 1).padStart(4, '0')}`;
+  // Productos de almacén ordenados alfabéticamente
+  const sortedAlmacen = useMemo(() => {
+    return [...data.almacen].sort(
+      (a, b) =>
+        (a.producto || '').localeCompare(b.producto || '', 'es', { sensitivity: 'base' }) ||
+        (a.marca || '').localeCompare(b.marca || '', 'es', { sensitivity: 'base' })
+    );
+  }, [data.almacen]);
 
-  // Importe total de todo el almacén (suma de existencia * precio de todos los productos)
+  // Parsed presentation for Insert modal
+  const parsedNewPresentacion = useMemo(() => {
+    return parsePresentacion(newPresentacion);
+  }, [newPresentacion]);
+
+  // Cantidad Total autocalculada (Cantidad * factor de Presentación)
+  const newCantidadTotalCalculada = useMemo(() => {
+    const cant = parseFloat(newCantidad);
+    if (isNaN(cant) || cant < 0) return 0;
+    return cant * parsedNewPresentacion.factor;
+  }, [newCantidad, parsedNewPresentacion.factor]);
+
+  // Importe automático en modal Insertar Producto (Precio de la presentación * Cantidad)
+  const newImporteCalculado = useMemo(() => {
+    const cant = parseFloat(newCantidad);
+    const price = parseFloat(newPrecio);
+    if (isNaN(cant) || isNaN(price) || cant < 0 || price < 0) return 0;
+    return cant * price;
+  }, [newCantidad, newPrecio]);
+
+  // Parsed presentation for Edit modal
+  const parsedEditPresentacion = useMemo(() => {
+    return parsePresentacion(editPresentacion);
+  }, [editPresentacion]);
+
+  const editFactorResuelto = useMemo(() => {
+    if (editPresentacion.trim() && parsedEditPresentacion.hasParsedFactorAndUnit) {
+      return parsedEditPresentacion.factor;
+    }
+    if (editingItem && editPresentacion.trim() === (editingItem.presentacion || '').trim()) {
+      return getItemPresentacionFactor(editingItem);
+    }
+    return 1;
+  }, [editingItem, editPresentacion, parsedEditPresentacion]);
+
+  const editUnidadResuelta = useMemo(() => {
+    if (editPresentacion.trim() && parsedEditPresentacion.hasParsedFactorAndUnit) {
+      return parsedEditPresentacion.unidad;
+    }
+    return editUnidad.trim() || editingItem?.unidad || 'u';
+  }, [editingItem, editPresentacion, parsedEditPresentacion, editUnidad]);
+
+  // Cantidad Total autocalculada en modal Editar Producto
+  const editCantidadTotalCalculada = useMemo(() => {
+    const cant = parseFloat(editCantidad);
+    if (isNaN(cant) || cant < 0) return 0;
+    return cant * editFactorResuelto;
+  }, [editCantidad, editFactorResuelto]);
+
+  // Importe total de todo el almacén (suma de (existencia / factorPresentacion) * precio)
   const totalImporteAlmacen = useMemo(() => {
     return data.almacen.reduce((sum, item) => {
       const existencia = Number(item.existencia) || 0;
       const precio = Number(item.precio) || 0;
-      return sum + existencia * precio;
+      const factor = getItemPresentacionFactor(item);
+      return sum + (existencia / factor) * precio;
     }, 0);
   }, [data.almacen]);
 
-  // Importe automático en modal Insertar Producto
-  const newImporteCalculado = useMemo(() => {
-    const exist = parseFloat(newExistencia);
-    const price = parseFloat(newPrecio);
-    if (isNaN(exist) || isNaN(price) || exist < 0 || price < 0) return 0;
-    return exist * price;
-  }, [newExistencia, newPrecio]);
-
-  // Importe automático en modal Editar Producto
+  // Importe automático en modal Editar Producto (Cantidad * Precio)
   const editImporteCalculado = useMemo(() => {
-    if (!editingItem) return 0;
+    const cant = parseFloat(editCantidad);
     const price = parseFloat(editPrecio);
-    if (isNaN(price) || price < 0) return 0;
-    return (Number(editingItem.existencia) || 0) * price;
-  }, [editingItem, editPrecio]);
+    if (isNaN(cant) || isNaN(price) || cant < 0 || price < 0) return 0;
+    return cant * price;
+  }, [editCantidad, editPrecio]);
 
   // Open Add modal
   const handleOpenAdd = () => {
     setNewProducto('');
     setNewMarca('');
     setNewPresentacion('');
-    setNewUnidad('kg');
-    setNewExistencia('0');
-    setNewPrecio('0');
-    setNewFechaConteo(toISODate(new Date()));
-    setNewStockMinimo('');
+    setNewCantidad('');
+    setNewPrecio('');
+    setNewFechaEntrada(toISODate(new Date()));
     setIsNewModalOpen(true);
   };
 
   const handleSaveNew = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newProducto.trim() || !newUnidad.trim()) return;
+    if (!newProducto.trim() || !newPresentacion.trim()) return;
 
-    const exist = parseFloat(newExistencia) || 0;
-    const price = parseFloat(newPrecio) || 0;
-    const min = newStockMinimo.trim() !== '' ? parseFloat(newStockMinimo) : undefined;
+    const cant = parseFloat(newCantidad);
+    const price = parseFloat(newPrecio);
+    if (isNaN(cant) || cant < 0 || isNaN(price) || price < 0) return;
+
+    const { factor, unidad } = parsedNewPresentacion;
+    const existenciaTotal = cant * factor;
 
     addAlmacenItem({
       producto: newProducto.trim(),
       marca: newMarca.trim() || undefined,
-      presentacion: newPresentacion.trim() || undefined,
-      unidad: newUnidad.trim(),
-      existencia: exist,
+      presentacion: newPresentacion.trim(),
+      unidad: unidad || 'u',
+      contenidoTotal: factor,
+      existencia: existenciaTotal,
       precio: price,
-      fechaConteo: newFechaConteo || toISODate(new Date()),
-      stockMinimo: min,
+      fechaConteo: newFechaEntrada || toISODate(new Date()),
     });
 
     setIsNewModalOpen(false);
@@ -125,28 +212,41 @@ export const WarehouseView: React.FC = () => {
 
   // Open Edit modal
   const handleOpenEdit = (item: AlmacenItem) => {
+    const factor = getItemPresentacionFactor(item);
+    const cant = (Number(item.existencia) || 0) / factor;
     setEditingItem(item);
     setEditProducto(item.producto);
     setEditMarca(item.marca || '');
     setEditPresentacion(item.presentacion || '');
     setEditUnidad(item.unidad);
+    setEditCantidad(String(Number(cant.toFixed(4))));
     setEditPrecio(String(item.precio ?? 0));
-    setEditStockMinimo(item.stockMinimo !== undefined ? String(item.stockMinimo) : '');
+    setEditFechaEntrada(item.fechaConteo || toISODate(new Date()));
   };
 
   const handleSaveEdit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingItem || !editProducto.trim()) return;
 
+    const cant = parseFloat(editCantidad);
     const price = parseFloat(editPrecio);
-    const min = editStockMinimo.trim() !== '' ? parseFloat(editStockMinimo) : undefined;
+    if (isNaN(cant) || cant < 0 || isNaN(price) || price < 0) return;
+
+    const existenciaTotal = cant * editFactorResuelto;
+    const resolvedFecha = editFechaEntrada || editingItem.fechaConteo || toISODate(new Date());
+
     updateAlmacenItem(editingItem.id, {
       producto: editProducto.trim(),
       marca: editMarca.trim() || undefined,
       presentacion: editPresentacion.trim() || undefined,
-      unidad: editUnidad.trim(),
-      precio: isNaN(price) || price < 0 ? 0 : price,
-      stockMinimo: min,
+      unidad: editUnidadResuelta,
+      contenidoTotal: editFactorResuelto,
+      existencia: existenciaTotal,
+      precio: price,
+      fechaConteo: resolvedFecha,
+      movimientos: (editingItem.movimientos || []).map((m) =>
+        m.comprobante === 'INICIAL' ? { ...m, fecha: resolvedFecha } : m
+      ),
     });
 
     setEditingItem(null);
@@ -192,9 +292,9 @@ export const WarehouseView: React.FC = () => {
     : null;
 
   return (
-    <div className="space-y-3 pb-10">
-      {/* Action button bar with Total Warehouse Importe to the left of Insertar Producto */}
-      <div className="flex flex-wrap items-center justify-end gap-3">
+    <div className="space-y-3 pb-2">
+      {/* Action button bar with Total Warehouse Importe aligned left and Insertar Producto aligned right */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-md shadow-2xs">
           <span className="text-xs font-semibold text-amber-900">
             Importe Total en Almacén:
@@ -216,21 +316,21 @@ export const WarehouseView: React.FC = () => {
 
       {/* Almacén Table */}
       <div className="bg-white border border-gray-200 rounded-lg overflow-hidden shadow-2xs">
-        <div className="overflow-x-auto">
+        <div className="overflow-auto max-h-[calc(100dvh-11.5rem)]">
           <table className="w-full text-left border-collapse text-xs">
-            <thead>
-              <tr className="bg-slate-50 border-b border-gray-200 text-gray-600 font-semibold">
-                <th className="py-2 px-3 w-12 text-center">No.</th>
-                <th className="py-2 px-3">Producto</th>
-                <th className="py-2 px-3 text-right w-36">Existencia (Stock Actual)</th>
-                <th className="py-2 px-3 text-right w-28">Precio</th>
-                <th className="py-2 px-3 text-right w-32">Importe</th>
-                <th className="py-2 px-3 text-right w-28">Stock Mínimo</th>
-                <th className="py-2 px-3 text-center w-52">Acciones</th>
+            <thead className="sticky top-0 z-20 bg-slate-50">
+              <tr className="bg-slate-50 text-gray-600 font-semibold">
+                <th className="py-2 px-3 sticky top-0 z-20 bg-slate-50 shadow-[inset_0_-1px_0_0_#e5e7eb]">Producto / Marca</th>
+                <th className="py-2 px-3 sticky top-0 z-20 bg-slate-50 shadow-[inset_0_-1px_0_0_#e5e7eb]">Presentación</th>
+                <th className="py-2 px-3 text-right w-24 sticky top-0 z-20 bg-slate-50 shadow-[inset_0_-1px_0_0_#e5e7eb]">Cantidad</th>
+                <th className="py-2 px-3 text-right w-32 sticky top-0 z-20 bg-slate-50 shadow-[inset_0_-1px_0_0_#e5e7eb]">Cantidad Total</th>
+                <th className="py-2 px-3 text-right w-28 sticky top-0 z-20 bg-slate-50 shadow-[inset_0_-1px_0_0_#e5e7eb]">Precio</th>
+                <th className="py-2 px-3 text-right w-28 sticky top-0 z-20 bg-slate-50 shadow-[inset_0_-1px_0_0_#e5e7eb]">Importe</th>
+                <th className="py-2 px-3 text-center w-52 sticky top-0 z-20 bg-slate-50 shadow-[inset_0_-1px_0_0_#e5e7eb]">Acciones</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100">
-              {data.almacen.length === 0 ? (
+              {sortedAlmacen.length === 0 ? (
                 <tr>
                   <td colSpan={7} className="py-8 text-center text-gray-500">
                     <p className="text-xs">No hay materias primas registradas en el almacén.</p>
@@ -244,85 +344,109 @@ export const WarehouseView: React.FC = () => {
                   </td>
                 </tr>
               ) : (
-                data.almacen.map((item, index) => {
-                  const isUnderMin =
-                    item.stockMinimo !== undefined &&
-                    item.stockMinimo > 0 &&
-                    item.existencia <= item.stockMinimo;
+                sortedAlmacen.map((item) => {
                   const itemPrecio = Number(item.precio) || 0;
-                  const itemImporte = (Number(item.existencia) || 0) * itemPrecio;
+                  const factor = getItemPresentacionFactor(item);
+                  const existencia = Number(item.existencia) || 0;
+                  const cantPresentaciones = existencia / factor;
+                  const itemImporte = cantPresentaciones * itemPrecio;
+                  const isAgotado = existencia <= 0;
 
                   return (
                     <tr
                       key={item.id}
                       className={`transition-colors ${
-                        isUnderMin
-                          ? 'bg-rose-50/70 hover:bg-rose-100/60'
+                        isAgotado
+                          ? 'bg-rose-50/90 hover:bg-rose-100/75'
                           : 'hover:bg-slate-50'
                       }`}
                     >
-                      <td className="py-2 px-3 text-center text-gray-400 font-mono text-[11px]">
-                        {index + 1}
-                      </td>
-                      <td className="py-2 px-3">
+                      <td className="py-2 px-3 relative z-10">
                         <div className="flex items-center gap-2 flex-wrap">
-                          <span className="font-semibold text-gray-900">{item.producto}</span>
+                          <span
+                            className={`font-semibold ${
+                              isAgotado ? 'text-rose-950' : 'text-gray-900'
+                            }`}
+                          >
+                            {item.producto}
+                          </span>
                           {item.marca && (
-                            <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-slate-100 text-slate-700 border border-slate-200">
+                            <span
+                              className={`text-[10px] font-medium px-1.5 py-0.5 rounded border ${
+                                isAgotado
+                                  ? 'bg-rose-100/80 text-rose-800 border-rose-200'
+                                  : 'bg-slate-100 text-slate-700 border-slate-200'
+                              }`}
+                            >
                               {item.marca}
                             </span>
                           )}
-                          {isUnderMin && (
-                            <span className="inline-block px-1.5 py-0.5 rounded text-[9px] font-black uppercase tracking-wider bg-rose-600 text-white animate-pulse">
-                              Bajo Mínimo
+                          {isAgotado && (
+                            <span className="text-[10px] font-bold uppercase tracking-wider text-rose-700">
+                              · Agotado
                             </span>
                           )}
                         </div>
-                        <div className="text-[11px] text-gray-600 flex items-center flex-wrap gap-2 mt-0.5">
-                          <span className="font-mono text-gray-700 bg-gray-100 px-1 rounded">
-                            {item.codigo}
-                          </span>
-                          <span>•</span>
-                          <span>Unidad: {item.unidad}</span>
-                          {item.presentacion && (
-                            <>
-                              <span>•</span>
-                              <span>Pres.: {item.presentacion}</span>
-                            </>
-                          )}
-                          <span>•</span>
-                          <span>Conteo: {formatDate(item.fechaConteo)}</span>
-                        </div>
                       </td>
-                      <td className="py-2 px-3 text-right">
+                      <td className="py-2 px-3 text-gray-700 relative z-10">
+                        {item.presentacion ? (
+                          <span className={isAgotado ? 'text-rose-900/90' : ''}>
+                            {item.presentacion}
+                          </span>
+                        ) : (
+                          <span className={isAgotado ? 'text-rose-700/80' : 'text-gray-500'}>
+                            {item.unidad}
+                          </span>
+                        )}
+                      </td>
+                      <td className="py-2 px-3 text-right font-mono font-medium relative">
+                        {isAgotado && (
+                          <span
+                            aria-hidden="true"
+                            className="pointer-events-none select-none absolute inset-y-0 left-1/2 -translate-x-1/2 flex items-center justify-center text-sm sm:text-base font-black uppercase tracking-[0.5em] text-rose-500/20 -rotate-3 whitespace-nowrap z-0"
+                          >
+                            AGOTADO
+                          </span>
+                        )}
                         <span
-                          className={`font-black text-sm ${
-                            isUnderMin ? 'text-rose-700' : 'text-gray-900'
+                          className={`relative z-10 ${
+                            isAgotado ? 'text-rose-700 font-bold' : 'text-gray-800'
                           }`}
                         >
-                          {formatNumber(item.existencia)}
+                          {formatNumber(cantPresentaciones)}
                         </span>
-                        <span className="text-[11px] text-gray-600 ml-1 font-medium">
+                      </td>
+                      <td className="py-2 px-3 text-right whitespace-nowrap relative z-10">
+                        <span
+                          className={`font-black text-sm font-mono ${
+                            isAgotado ? 'text-rose-700' : 'text-gray-900'
+                          }`}
+                        >
+                          {formatNumber(existencia)}
+                        </span>
+                        <span
+                          className={`text-[11px] ml-1 font-medium ${
+                            isAgotado ? 'text-rose-600' : 'text-gray-600'
+                          }`}
+                        >
                           {item.unidad}
                         </span>
                       </td>
-                      <td className="py-2 px-3 text-right text-gray-700 font-mono">
+                      <td
+                        className={`py-2 px-3 text-right font-mono relative z-10 ${
+                          isAgotado ? 'text-rose-900/80' : 'text-gray-700'
+                        }`}
+                      >
                         {formatNumber(itemPrecio)}
                       </td>
-                      <td className="py-2 px-3 text-right font-bold text-emerald-800 font-mono">
+                      <td
+                        className={`py-2 px-3 text-right font-bold font-mono relative z-10 ${
+                          isAgotado ? 'text-rose-700' : 'text-emerald-800'
+                        }`}
+                      >
                         {formatNumber(itemImporte)}
                       </td>
-                      <td className="py-2 px-3 text-right text-gray-700 font-medium">
-                        {item.stockMinimo !== undefined && item.stockMinimo > 0 ? (
-                          <span>
-                            {formatNumber(item.stockMinimo)}{' '}
-                            <span className="text-[10px] text-gray-600">{item.unidad}</span>
-                          </span>
-                        ) : (
-                          <span className="text-gray-400">—</span>
-                        )}
-                      </td>
-                      <td className="py-2 px-3 text-center">
+                      <td className="py-2 px-3 text-center relative z-10">
                         <div className="flex items-center justify-center gap-1 flex-wrap">
                           {/* Botón + Entrada */}
                           <button
@@ -397,14 +521,10 @@ export const WarehouseView: React.FC = () => {
                   <span>Tarjeta de Estiba — {activeKardexItem.producto}</span>
                 </h3>
                 <p className="text-[11px] text-gray-500 mt-0.5">
-                  Código: <span className="font-mono text-gray-800">{activeKardexItem.codigo}</span> | Unidad: {activeKardexItem.unidad} | Existencia actual:{' '}
+                  Unidad: {activeKardexItem.unidad} | Existencia actual:{' '}
                   <span className="font-black text-gray-900">
                     {formatNumber(activeKardexItem.existencia)} {activeKardexItem.unidad}
-                  </span>{' '}
-                  | Mínimo:{' '}
-                  {activeKardexItem.stockMinimo !== undefined
-                    ? `${formatNumber(activeKardexItem.stockMinimo)} ${activeKardexItem.unidad}`
-                    : '—'}
+                  </span>
                 </p>
               </div>
               <button
@@ -633,8 +753,8 @@ export const WarehouseView: React.FC = () => {
       {/* Modal Insertar Producto (Materia Prima) */}
       {isNewModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-3 bg-black/50 backdrop-blur-xs">
-          <div className="bg-white rounded-lg shadow-xl max-w-md w-full p-4 space-y-3 animate-in fade-in duration-150 max-h-[92vh] overflow-y-auto">
-            <div className="flex items-center justify-between border-b border-gray-100 pb-2">
+          <div className="bg-white rounded-lg shadow-xl max-w-lg w-full p-3.5 space-y-2.5 animate-in fade-in duration-150 max-h-[92vh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b border-gray-100 pb-1.5">
               <h3 className="font-bold text-sm text-gray-900">Insertar Producto en Almacén</h3>
               <button
                 type="button"
@@ -645,95 +765,102 @@ export const WarehouseView: React.FC = () => {
               </button>
             </div>
 
-            <form onSubmit={handleSaveNew} className="space-y-3 text-xs">
-              <div>
-                <label className="font-semibold text-gray-700 block mb-1">
-                  Código (Auto-generado):
-                </label>
-                <input
-                  type="text"
-                  readOnly
-                  disabled
-                  value={nextCode}
-                  className="w-full h-8 px-2 border border-gray-200 rounded bg-gray-100 font-mono text-gray-600"
-                />
-              </div>
-
-              <div>
-                <label className="font-semibold text-gray-700 block mb-1">
-                  Nombre de la Materia Prima o Producto <span className="text-rose-500">*</span>:
-                </label>
-                <input
-                  type="text"
-                  required
-                  autoFocus
-                  placeholder="Ej. Harina de trigo, Azúcar, Esencia de vainilla..."
-                  value={newProducto}
-                  onChange={(e) => setNewProducto(e.target.value)}
-                  className="w-full h-8 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
-                />
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                <div>
-                  <label className="font-semibold text-gray-700 block mb-1">
-                    Marca:
+            <form onSubmit={handleSaveNew} className="space-y-2 text-xs">
+              <div className="flex flex-wrap sm:flex-nowrap gap-2">
+                <div className="w-[126px] shrink-0">
+                  <label className="font-semibold text-gray-700 text-[11px] block mb-0.5">
+                    Fecha Entrada <span className="text-rose-500">*</span>:
                   </label>
                   <input
-                    type="text"
-                    placeholder="Ej. Los Portales, La Estancia..."
-                    value={newMarca}
-                    onChange={(e) => setNewMarca(e.target.value)}
-                    className="w-full h-8 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
+                    type="date"
+                    required
+                    value={newFechaEntrada}
+                    onChange={(e) => setNewFechaEntrada(e.target.value)}
+                    className="w-full h-7 px-1.5 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
                   />
                 </div>
-                <div>
-                  <label className="font-semibold text-gray-700 block mb-1">
-                    Presentación:
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="Ej. Sacos de 25 kg, Pomo de 500 ml"
-                    value={newPresentacion}
-                    onChange={(e) => setNewPresentacion(e.target.value)}
-                    className="w-full h-8 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label className="font-semibold text-gray-700 block mb-1">
-                    Unidad de Medida <span className="text-rose-500">*</span>:
+                <div className="flex-1 min-w-[140px]">
+                  <label className="font-semibold text-gray-700 text-[11px] block mb-0.5">
+                    Materia Prima / Producto <span className="text-rose-500">*</span>:
                   </label>
                   <input
                     type="text"
                     required
-                    placeholder="kg, lb, u, saco, pomo..."
-                    value={newUnidad}
-                    onChange={(e) => setNewUnidad(e.target.value)}
-                    className="w-full h-8 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
+                    autoFocus
+                    placeholder="Ej. Harina, Azúcar..."
+                    value={newProducto}
+                    onChange={(e) => setNewProducto(e.target.value)}
+                    className="w-full h-7 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
                   />
                 </div>
-                <div>
-                  <label className="font-semibold text-gray-700 block mb-1">
-                    Existencia Inicial <span className="text-rose-500">*</span>:
+                <div className="w-full sm:w-28 shrink-0">
+                  <label className="font-semibold text-gray-700 text-[11px] block mb-0.5">
+                    Marca (Opc.):
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="Ej. Bonoli"
+                    value={newMarca}
+                    onChange={(e) => setNewMarca(e.target.value)}
+                    className="w-full h-7 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-12 gap-2">
+                <div className="col-span-12 sm:col-span-7">
+                  <label className="font-semibold text-gray-700 text-[11px] block mb-0.5">
+                    Presentación <span className="text-rose-500">*</span>:
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="Ej. Sacos de 25 kg, Pomo 500 ml"
+                    value={newPresentacion}
+                    onChange={(e) => setNewPresentacion(e.target.value)}
+                    className="w-full h-7 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
+                  />
+                </div>
+                <div className="col-span-12 sm:col-span-5">
+                  <label className="font-semibold text-gray-700 text-[11px] block mb-0.5">
+                    Cantidad Total (Calc.):
+                  </label>
+                  <div
+                    title={
+                      newPresentacion.trim() && parsedNewPresentacion.hasParsedFactorAndUnit
+                        ? `${newCantidad || '0'} × ${formatNumber(parsedNewPresentacion.factor)} ${parsedNewPresentacion.unidad}`
+                        : undefined
+                    }
+                    className="w-full h-7 px-2 border border-amber-200 rounded bg-amber-50 flex items-center justify-end gap-1 font-black text-amber-950 font-mono truncate"
+                  >
+                    <span>{formatNumber(newCantidadTotalCalculada)}</span>
+                    {newPresentacion.trim() && (
+                      <span className="text-[11px] font-semibold text-amber-800">
+                        {parsedNewPresentacion.unidad}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-12 gap-2">
+                <div className="col-span-3">
+                  <label className="font-semibold text-gray-700 text-[11px] block mb-0.5">
+                    Cantidad <span className="text-rose-500">*</span>:
                   </label>
                   <input
                     type="number"
                     step="any"
                     min="0"
                     required
-                    value={newExistencia}
-                    onChange={(e) => setNewExistencia(e.target.value)}
-                    className="w-full h-8 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
+                    placeholder="5"
+                    value={newCantidad}
+                    onChange={(e) => setNewCantidad(e.target.value)}
+                    className="w-full h-7 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500 font-mono text-right"
                   />
                 </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label className="font-semibold text-gray-700 block mb-1">
+                <div className="col-span-4">
+                  <label className="font-semibold text-gray-700 text-[11px] block mb-0.5">
                     Precio <span className="text-rose-500">*</span>:
                   </label>
                   <input
@@ -744,45 +871,16 @@ export const WarehouseView: React.FC = () => {
                     placeholder="0.00"
                     value={newPrecio}
                     onChange={(e) => setNewPrecio(e.target.value)}
-                    className="w-full h-8 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500 font-mono"
+                    className="w-full h-7 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500 font-mono text-right"
                   />
                 </div>
-                <div>
-                  <label className="font-semibold text-gray-700 block mb-1">
-                    Importe (Calculado):
+                <div className="col-span-5">
+                  <label className="font-semibold text-gray-700 text-[11px] block mb-0.5">
+                    Importe (Calc.):
                   </label>
-                  <div className="w-full h-8 px-2.5 border border-emerald-200 rounded bg-emerald-50 flex items-center justify-end font-black text-emerald-800 font-mono">
+                  <div className="w-full h-7 px-2 border border-emerald-200 rounded bg-emerald-50 flex items-center justify-end font-black text-emerald-800 font-mono truncate">
                     {formatNumber(newImporteCalculado)}
                   </div>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label className="font-semibold text-gray-700 block mb-1">
-                    Fecha de Conteo <span className="text-rose-500">*</span>:
-                  </label>
-                  <input
-                    type="date"
-                    required
-                    value={newFechaConteo}
-                    onChange={(e) => setNewFechaConteo(e.target.value)}
-                    className="w-full h-8 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
-                  />
-                </div>
-                <div>
-                  <label className="font-semibold text-gray-700 block mb-1">
-                    Stock Mínimo (Opcional):
-                  </label>
-                  <input
-                    type="number"
-                    step="any"
-                    min="0"
-                    placeholder="Ej. 10"
-                    value={newStockMinimo}
-                    onChange={(e) => setNewStockMinimo(e.target.value)}
-                    className="w-full h-8 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
-                  />
                 </div>
               </div>
 
@@ -790,13 +888,13 @@ export const WarehouseView: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => setIsNewModalOpen(false)}
-                  className="px-3 py-1.5 font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded"
+                  className="px-3 py-1 font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded"
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-1.5 font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded transition-colors"
+                  className="px-3.5 py-1 font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded transition-colors"
                 >
                   Insertar Producto
                 </button>
@@ -809,8 +907,8 @@ export const WarehouseView: React.FC = () => {
       {/* Modal Editar Producto (Materia Prima) */}
       {editingItem && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-3 bg-black/50 backdrop-blur-xs">
-          <div className="bg-white rounded-lg shadow-xl max-w-md w-full p-4 space-y-3 animate-in fade-in duration-150 max-h-[92vh] overflow-y-auto">
-            <div className="flex items-center justify-between border-b border-gray-100 pb-2">
+          <div className="bg-white rounded-lg shadow-xl max-w-lg w-full p-3.5 space-y-2.5 animate-in fade-in duration-150 max-h-[92vh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b border-gray-100 pb-1.5">
               <h3 className="font-bold text-sm text-gray-900">Editar Producto en Almacén</h3>
               <button
                 type="button"
@@ -821,85 +919,99 @@ export const WarehouseView: React.FC = () => {
               </button>
             </div>
 
-            <form onSubmit={handleSaveEdit} className="space-y-3 text-xs">
-              <div>
-                <label className="font-semibold text-gray-700 block mb-1">Código:</label>
-                <input
-                  type="text"
-                  disabled
-                  value={editingItem.codigo}
-                  className="w-full h-8 px-2 border border-gray-200 rounded bg-gray-100 font-mono text-gray-600"
-                />
-              </div>
-
-              <div>
-                <label className="font-semibold text-gray-700 block mb-1">
-                  Nombre de la Materia Prima o Producto:
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={editProducto}
-                  onChange={(e) => setEditProducto(e.target.value)}
-                  className="w-full h-8 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
-                />
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                <div>
-                  <label className="font-semibold text-gray-700 block mb-1">Marca:</label>
+            <form onSubmit={handleSaveEdit} className="space-y-2 text-xs">
+              <div className="flex flex-wrap sm:flex-nowrap gap-2">
+                <div className="w-[126px] shrink-0">
+                  <label className="font-semibold text-gray-700 text-[11px] block mb-0.5">
+                    Fecha Entrada <span className="text-rose-500">*</span>:
+                  </label>
                   <input
-                    type="text"
-                    placeholder="Ej. Los Portales..."
-                    value={editMarca}
-                    onChange={(e) => setEditMarca(e.target.value)}
-                    className="w-full h-8 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
+                    type="date"
+                    required
+                    value={editFechaEntrada}
+                    onChange={(e) => setEditFechaEntrada(e.target.value)}
+                    className="w-full h-7 px-1.5 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
                   />
                 </div>
-                <div>
-                  <label className="font-semibold text-gray-700 block mb-1">Presentación:</label>
-                  <input
-                    type="text"
-                    placeholder="Ej. Sacos de 25 kg..."
-                    value={editPresentacion}
-                    onChange={(e) => setEditPresentacion(e.target.value)}
-                    className="w-full h-8 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label className="font-semibold text-gray-700 block mb-1">
-                    Unidad de Medida:
+                <div className="flex-1 min-w-[140px]">
+                  <label className="font-semibold text-gray-700 text-[11px] block mb-0.5">
+                    Materia Prima / Producto:
                   </label>
                   <input
                     type="text"
                     required
-                    value={editUnidad}
-                    onChange={(e) => setEditUnidad(e.target.value)}
-                    className="w-full h-8 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
+                    value={editProducto}
+                    onChange={(e) => setEditProducto(e.target.value)}
+                    className="w-full h-7 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
                   />
                 </div>
-                <div>
-                  <label className="font-semibold text-gray-700 block mb-1">
-                    Stock Mínimo (Opcional):
+                <div className="w-full sm:w-28 shrink-0">
+                  <label className="font-semibold text-gray-700 text-[11px] block mb-0.5">
+                    Marca (Opc.):
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="Ej. Bonoli"
+                    value={editMarca}
+                    onChange={(e) => setEditMarca(e.target.value)}
+                    className="w-full h-7 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-12 gap-2">
+                <div className="col-span-12 sm:col-span-7">
+                  <label className="font-semibold text-gray-700 text-[11px] block mb-0.5">
+                    Presentación:
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="Ej. Sacos de 25 kg, Pomo 500 ml"
+                    value={editPresentacion}
+                    onChange={(e) => setEditPresentacion(e.target.value)}
+                    className="w-full h-7 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
+                  />
+                </div>
+                <div className="col-span-12 sm:col-span-5">
+                  <label className="font-semibold text-gray-700 text-[11px] block mb-0.5">
+                    Cantidad Total (Calc.):
+                  </label>
+                  <div
+                    title={
+                      editPresentacion.trim() && parsedEditPresentacion.hasParsedFactorAndUnit
+                        ? `${editCantidad || '0'} × ${formatNumber(editFactorResuelto)} ${editUnidadResuelta}`
+                        : undefined
+                    }
+                    className="w-full h-7 px-2 border border-amber-200 rounded bg-amber-50 flex items-center justify-end gap-1 font-black text-amber-950 font-mono truncate"
+                  >
+                    <span>{formatNumber(editCantidadTotalCalculada)}</span>
+                    <span className="text-[11px] font-semibold text-amber-800">
+                      {editUnidadResuelta}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-12 gap-2">
+                <div className="col-span-3">
+                  <label className="font-semibold text-gray-700 text-[11px] block mb-0.5">
+                    Cantidad <span className="text-rose-500">*</span>:
                   </label>
                   <input
                     type="number"
                     step="any"
                     min="0"
-                    placeholder="Ej. 10"
-                    value={editStockMinimo}
-                    onChange={(e) => setEditStockMinimo(e.target.value)}
-                    className="w-full h-8 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
+                    required
+                    placeholder="5"
+                    value={editCantidad}
+                    onChange={(e) => setEditCantidad(e.target.value)}
+                    className="w-full h-7 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500 font-mono text-right"
                   />
                 </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label className="font-semibold text-gray-700 block mb-1">Precio:</label>
+                <div className="col-span-4">
+                  <label className="font-semibold text-gray-700 text-[11px] block mb-0.5">
+                    Precio <span className="text-rose-500">*</span>:
+                  </label>
                   <input
                     type="number"
                     step="any"
@@ -907,14 +1019,14 @@ export const WarehouseView: React.FC = () => {
                     required
                     value={editPrecio}
                     onChange={(e) => setEditPrecio(e.target.value)}
-                    className="w-full h-8 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500 font-mono"
+                    className="w-full h-7 px-2 border border-gray-300 rounded focus:ring-1 focus:ring-amber-500 font-mono text-right"
                   />
                 </div>
-                <div>
-                  <label className="font-semibold text-gray-700 block mb-1">
-                    Importe Actual ({formatNumber(editingItem.existencia)} {editingItem.unidad}):
+                <div className="col-span-5">
+                  <label className="font-semibold text-gray-700 text-[11px] block mb-0.5">
+                    Importe (Calc.):
                   </label>
-                  <div className="w-full h-8 px-2.5 border border-emerald-200 rounded bg-emerald-50 flex items-center justify-end font-black text-emerald-800 font-mono">
+                  <div className="w-full h-7 px-2 border border-emerald-200 rounded bg-emerald-50 flex items-center justify-end font-black text-emerald-800 font-mono truncate">
                     {formatNumber(editImporteCalculado)}
                   </div>
                 </div>
@@ -924,13 +1036,13 @@ export const WarehouseView: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => setEditingItem(null)}
-                  className="px-3 py-1.5 font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded"
+                  className="px-3 py-1 font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded"
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-1.5 font-semibold text-white bg-amber-600 hover:bg-amber-700 rounded transition-colors"
+                  className="px-3.5 py-1 font-semibold text-white bg-amber-600 hover:bg-amber-700 rounded transition-colors"
                 >
                   Guardar Cambios
                 </button>

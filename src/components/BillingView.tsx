@@ -55,14 +55,15 @@ export const BillingView: React.FC = () => {
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const clientOptions = useMemo(() => {
-    const list = data.clientes.map((c) => c.nombre);
+    const list = Array.from(new Set(data.clientes.map((c) => c.nombre)));
     if (!list.includes('Otros')) list.push('Otros');
-    return list;
+    return list.sort((a, b) => a.localeCompare(b, 'es', { sensitivity: 'base' }));
   }, [data.clientes]);
 
-  // When client is selected in modal, load CI, phone, and address
+  // When client is selected in modal, load CI, phone, and address and reset selected vales
   const handleSelectClientInModal = (clientName: string) => {
     setModalCliente(clientName);
+    setSelectedVales([]);
     const found = data.clientes.find((c) => c.nombre === clientName);
     if (found) {
       setModalTelefono(found.telefono || '');

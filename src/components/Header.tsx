@@ -26,10 +26,6 @@ const MODULE_INFO: Record<string, { title: string; desc: string }> = {
     title: 'FACTURACIÓN',
     desc: 'Emisión de facturas y envío por WhatsApp',
   },
-  Reportes: {
-    title: 'REPORTES INTELIGENTES',
-    desc: 'Generación de reportes con IA y mensajes para WhatsApp',
-  },
   Gastos: {
     title: 'GASTOS',
     desc: 'Control de egresos, compras y salarios',
@@ -81,7 +77,7 @@ export const Header: React.FC<HeaderProps> = ({
   row1RightAction,
   row2Content,
 }) => {
-  const { currentModule, exportBackup, importBackup, isSyncing, syncWithCloud, setIsCloudSyncModalOpen } = useApp();
+  const { currentModule, exportBackup, importBackup, isSyncing, setIsCloudSyncModalOpen } = useApp();
   const { user, signInWithGoogle, signOut } = useAuth();
   const [isBackupModalOpen, setIsBackupModalOpen] = useState<boolean>(false);
   const [importStatus, setImportStatus] = useState<{ ok: boolean; msg: string } | null>(null);
@@ -132,12 +128,12 @@ export const Header: React.FC<HeaderProps> = ({
             <Menu className="w-5 h-5" />
           </button>
 
-          <div className="flex items-baseline gap-2 truncate">
-            <h1 className="text-xs sm:text-sm font-black text-gray-900 tracking-wide shrink-0">
+          <div className="flex flex-col justify-center gap-0 min-w-0">
+            <h1 className="text-xs sm:text-sm font-black text-gray-900 tracking-wide leading-[1.15] truncate">
               {info.title}
             </h1>
             {info.desc && (
-              <span className="text-[11px] sm:text-xs text-gray-600 italic font-medium truncate hidden sm:inline">
+              <span className="text-[11px] text-gray-600 italic font-medium leading-[1.15] truncate hidden sm:block">
                 {info.desc}
               </span>
             )}
@@ -150,13 +146,13 @@ export const Header: React.FC<HeaderProps> = ({
           {/* Botón de Sincronización en la Nube */}
           <button
             type="button"
-            onClick={() => syncWithCloud('pull')}
+            onClick={() => setIsCloudSyncModalOpen(true)}
             disabled={isSyncing}
             className="flex items-center gap-1.5 px-2.5 py-1 text-amber-900 bg-amber-50 hover:bg-amber-100 disabled:opacity-60 rounded-md text-xs font-semibold border border-amber-200 transition-colors cursor-pointer"
-            title="Sincronizar datos con Cloud SQL (PostgreSQL)"
+            title="Sincronización en tiempo real con Firebase Firestore"
           >
             <Cloud className={`w-3.5 h-3.5 text-amber-600 ${isSyncing ? 'animate-spin' : ''}`} />
-            <span className="hidden sm:inline">{isSyncing ? 'Sincronizando...' : 'Nube'}</span>
+            <span className="hidden sm:inline">{isSyncing ? 'Sincronizando...' : 'Firestore'}</span>
           </button>
 
           {/* Botón de Gestión de Respaldos */}
@@ -302,10 +298,10 @@ export const Header: React.FC<HeaderProps> = ({
                 <div>
                   <h4 className="font-bold text-amber-900 mb-0.5 flex items-center gap-1.5">
                     <Cloud className="w-4 h-4 text-amber-700" />
-                    Sincronización Cloud SQL (Nube)
+                    Sincronización Firebase Firestore (Nube)
                   </h4>
                   <p className="text-gray-600 text-[11px]">
-                    Sincroniza y descarga automáticamente los datos directamente desde la base de datos PostgreSQL.
+                    Todos los cambios se sincronizan automáticamente en tiempo real con Firebase Firestore entre dispositivos.
                   </p>
                 </div>
                 <button

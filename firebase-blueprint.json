@@ -1,0 +1,327 @@
+{
+  "entities": {
+    "ConnectionTest": {
+      "title": "ConnectionTest",
+      "description": "Minimal document used to validate live Firestore server connectivity.",
+      "type": "object",
+      "properties": {
+        "ok": { "type": "boolean", "description": "Connectivity flag." }
+      },
+      "required": ["ok"]
+    },
+    "EmailRole": {
+      "title": "EmailRole",
+      "description": "PII-free role and active access gate keyed by sanitized lowercase email.",
+      "type": "object",
+      "properties": {
+        "rol": {
+          "type": "string",
+          "enum": ["Administrador", "Operador", "Lector"],
+          "maxLength": 20,
+          "description": "Assigned role for access control."
+        },
+        "activo": { "type": "boolean", "description": "Whether this account is active." },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Server timestamp of update." }
+      },
+      "required": ["rol", "activo", "updatedAt"]
+    },
+    "UsuarioAutorizado": {
+      "title": "UsuarioAutorizado",
+      "description": "Authorized Gmail user profile and role assignment (admin-only PII).",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "maxLength": 150 },
+        "nombre": { "type": "string", "maxLength": 120 },
+        "rol": {
+          "type": "string",
+          "enum": ["Administrador", "Operador", "Lector"],
+          "maxLength": 20
+        },
+        "fechaAgregado": { "type": "string", "maxLength": 30 },
+        "activo": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "email", "rol", "fechaAgregado", "activo", "updatedAt"]
+    },
+    "ConfigMeta": {
+      "title": "ConfigMeta",
+      "description": "Global accounting configuration including next vale number, worker pay rates, profit margins, and distribution rules.",
+      "type": "object",
+      "properties": {
+        "siguienteVale": { "type": "number" },
+        "periodo": { "type": "object" },
+        "pagoPorDulceTrabajador": { "type": "object" },
+        "gananciaPorUnidad": { "type": "array" },
+        "reparto": { "type": "object" },
+        "allowedEmails": { "type": "array" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "updatedBy": { "type": "string", "maxLength": 150 }
+      },
+      "required": ["siguienteVale", "periodo", "pagoPorDulceTrabajador", "gananciaPorUnidad", "reparto", "allowedEmails", "updatedAt"]
+    },
+    "ConfigCaja": {
+      "title": "ConfigCaja",
+      "description": "Cash register opening balance and start date configuration.",
+      "type": "object",
+      "properties": {
+        "saldoInicial": { "type": "number" },
+        "fechaInicio": { "type": "string", "maxLength": 20, "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        "allowedEmails": { "type": "array" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "updatedBy": { "type": "string", "maxLength": 150 }
+      },
+      "required": ["saldoInicial", "fechaInicio", "allowedEmails", "updatedAt"]
+    },
+    "RepartoSemanal": {
+      "title": "RepartoSemanal",
+      "description": "Weekly profit distribution record.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "desde": { "type": "string", "maxLength": 20 },
+        "hasta": { "type": "string", "maxLength": 20 },
+        "ganancia": { "type": "number" },
+        "administrador": { "type": "number" },
+        "tatao": { "type": "number" },
+        "carlos": { "type": "number" },
+        "fechaPago": { "type": "string", "maxLength": 20 },
+        "estado": { "type": "string", "enum": ["Pagado", "Pendiente"], "maxLength": 20 },
+        "allowedEmails": { "type": "array" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "desde", "hasta", "ganancia", "administrador", "tatao", "carlos", "estado", "allowedEmails", "updatedAt"]
+    },
+    "Cliente": {
+      "title": "Cliente",
+      "description": "Customer directory record.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "nombre": { "type": "string", "maxLength": 150 },
+        "telefono": { "type": "string", "maxLength": 50 },
+        "email": { "type": "string", "maxLength": 150 },
+        "ci": { "type": "string", "maxLength": 50 },
+        "direccion": { "type": "string", "maxLength": 300 },
+        "allowedEmails": { "type": "array" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "nombre", "telefono", "allowedEmails", "updatedAt"]
+    },
+    "Producto": {
+      "title": "Producto",
+      "description": "Finished pastry product with pricing history.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "nombre": { "type": "string", "maxLength": 120 },
+        "costoUnitario": { "type": "number" },
+        "precioVigente": { "type": "number" },
+        "historicoPrecios": { "type": "array" },
+        "activo": { "type": "boolean" },
+        "allowedEmails": { "type": "array" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "nombre", "precioVigente", "historicoPrecios", "allowedEmails", "updatedAt"]
+    },
+    "ProduccionLote": {
+      "title": "ProduccionLote",
+      "description": "Daily production batch record.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "fecha": { "type": "string", "maxLength": 20 },
+        "producto": { "type": "string", "maxLength": 120 },
+        "cantidad": { "type": "number" },
+        "merma": { "type": "number" },
+        "costo": { "type": "number" },
+        "allowedEmails": { "type": "array" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "fecha", "producto", "cantidad", "merma", "costo", "allowedEmails", "updatedAt"]
+    },
+    "VentaVale": {
+      "title": "VentaVale",
+      "description": "Customer sale voucher with line items.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "vale": { "type": "string", "maxLength": 40 },
+        "fecha": { "type": "string", "maxLength": 20 },
+        "cliente": { "type": "string", "maxLength": 150 },
+        "lineas": { "type": "array" },
+        "importeTotal": { "type": "number" },
+        "formaPago": { "type": "string", "enum": ["Efectivo", "Transferencia"], "maxLength": 30 },
+        "nota": { "type": "string", "maxLength": 500 },
+        "allowedEmails": { "type": "array" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "vale", "fecha", "cliente", "lineas", "importeTotal", "allowedEmails", "updatedAt"]
+    },
+    "GastoItem": {
+      "title": "GastoItem",
+      "description": "Expense record for materials, salaries, utilities, or distributions.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "fecha": { "type": "string", "maxLength": 20 },
+        "categoria": { "type": "string", "maxLength": 50 },
+        "concepto": { "type": "string", "maxLength": 250 },
+        "importe": { "type": "number" },
+        "formaPago": { "type": "string", "enum": ["Efectivo", "Banco/Transferencia"], "maxLength": 40 },
+        "tipoSalario": { "type": "string", "maxLength": 30 },
+        "loteId": { "type": "string", "maxLength": 128 },
+        "repartoId": { "type": "string", "maxLength": 128 },
+        "generadoPor": { "type": "string", "maxLength": 30 },
+        "allowedEmails": { "type": "array" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "fecha", "categoria", "concepto", "importe", "formaPago", "allowedEmails", "updatedAt"]
+    },
+    "AlmacenItem": {
+      "title": "AlmacenItem",
+      "description": "Warehouse raw material item with stock and movements.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "codigo": { "type": "string", "maxLength": 40 },
+        "producto": { "type": "string", "maxLength": 150 },
+        "marca": { "type": "string", "maxLength": 120 },
+        "presentacion": { "type": "string", "maxLength": 120 },
+        "unidad": { "type": "string", "maxLength": 40 },
+        "existencia": { "type": "number" },
+        "precio": { "type": "number" },
+        "contenidoTotal": { "type": "number" },
+        "fechaConteo": { "type": "string", "maxLength": 20 },
+        "stockMinimo": { "type": "number" },
+        "movimientos": { "type": "array" },
+        "allowedEmails": { "type": "array" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "codigo", "producto", "unidad", "existencia", "precio", "fechaConteo", "movimientos", "allowedEmails", "updatedAt"]
+    },
+    "FacturaItem": {
+      "title": "FacturaItem",
+      "description": "Manually generated customer invoice covering selected vouchers.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "numero": { "type": "string", "maxLength": 40 },
+        "cliente": { "type": "string", "maxLength": 150 },
+        "telefono": { "type": "string", "maxLength": 50 },
+        "ci": { "type": "string", "maxLength": 50 },
+        "direccion": { "type": "string", "maxLength": 300 },
+        "fecha": { "type": "string", "maxLength": 20 },
+        "periodoVales": { "type": "string", "maxLength": 80 },
+        "valesIncluidos": { "type": "array" },
+        "valesDetalle": { "type": "array" },
+        "productosConsolidados": { "type": "array" },
+        "importeTotal": { "type": "number" },
+        "observaciones": { "type": "string", "maxLength": 500 },
+        "allowedEmails": { "type": "array" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "numero", "cliente", "telefono", "ci", "direccion", "fecha", "periodoVales", "valesIncluidos", "valesDetalle", "productosConsolidados", "importeTotal", "allowedEmails", "updatedAt"]
+    },
+    "JustificacionDiferencia": {
+      "title": "JustificacionDiferencia",
+      "description": "Reconciliation discrepancy justification note.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "fecha": { "type": "string", "maxLength": 20 },
+        "producto": { "type": "string", "maxLength": 120 },
+        "nota": { "type": "string", "maxLength": 1000 },
+        "fechaRegistro": { "type": "string", "maxLength": 40 },
+        "allowedEmails": { "type": "array" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "fecha", "nota", "fechaRegistro", "allowedEmails", "updatedAt"]
+    },
+    "Receta": {
+      "title": "Receta",
+      "description": "Production recipe with portioned ingredients and cost calculations.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "nombre": { "type": "string", "maxLength": 150 },
+        "ingredientes": { "type": "array" },
+        "costoIngredientes": { "type": "number" },
+        "unidadesRinde": { "type": "number" },
+        "porcentajeAdicionalCostos": { "type": "number" },
+        "porcentajeBeneficioEsperado": { "type": "number" },
+        "costoTotal": { "type": "number" },
+        "costoUnitario": { "type": "number" },
+        "precioSugeridoUnitario": { "type": "number" },
+        "fechaCreacion": { "type": "string", "maxLength": 40 },
+        "observaciones": { "type": "string", "maxLength": 1000 },
+        "notas": { "type": "string", "maxLength": 1000 },
+        "allowedEmails": { "type": "array" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "nombre", "ingredientes", "costoTotal", "allowedEmails", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/test/{docId}": {
+      "schema": { "$ref": "#/entities/ConnectionTest" },
+      "description": "Connectivity check document."
+    },
+    "/email_roles/{emailKey}": {
+      "schema": { "$ref": "#/entities/EmailRole" },
+      "description": "PII-free role lookup table keyed by sanitized email."
+    },
+    "/usuarios_autorizados/{usuarioId}": {
+      "schema": { "$ref": "#/entities/UsuarioAutorizado" },
+      "description": "Admin-only directory of authorized user accounts."
+    },
+    "/config/meta": {
+      "schema": { "$ref": "#/entities/ConfigMeta" },
+      "description": "Global accounting metadata and parameters."
+    },
+    "/config/caja": {
+      "schema": { "$ref": "#/entities/ConfigCaja" },
+      "description": "Cash register configuration."
+    },
+    "/repartos/{repartoId}": {
+      "schema": { "$ref": "#/entities/RepartoSemanal" },
+      "description": "Weekly profit distributions."
+    },
+    "/clientes/{clienteId}": {
+      "schema": { "$ref": "#/entities/Cliente" },
+      "description": "Customer directory."
+    },
+    "/productos/{productoId}": {
+      "schema": { "$ref": "#/entities/Producto" },
+      "description": "Finished pastry products and price histories."
+    },
+    "/produccion/{loteId}": {
+      "schema": { "$ref": "#/entities/ProduccionLote" },
+      "description": "Production batches."
+    },
+    "/ventas/{ventaId}": {
+      "schema": { "$ref": "#/entities/VentaVale" },
+      "description": "Sales vouchers."
+    },
+    "/gastos/{gastoId}": {
+      "schema": { "$ref": "#/entities/GastoItem" },
+      "description": "Expense records."
+    },
+    "/almacen/{itemId}": {
+      "schema": { "$ref": "#/entities/AlmacenItem" },
+      "description": "Warehouse inventory and movement cards."
+    },
+    "/facturas/{facturaId}": {
+      "schema": { "$ref": "#/entities/FacturaItem" },
+      "description": "Manually issued customer invoices."
+    },
+    "/justificaciones/{justificacionId}": {
+      "schema": { "$ref": "#/entities/JustificacionDiferencia" },
+      "description": "Reconciliation justifications."
+    },
+    "/recetas/{recetaId}": {
+      "schema": { "$ref": "#/entities/Receta" },
+      "description": "Recipes and cost formulas."
+    }
+  }
+}

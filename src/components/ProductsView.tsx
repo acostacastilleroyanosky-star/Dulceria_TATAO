@@ -1,6 +1,6 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { useApp } from '../context/AppContext';
-import { formatNumber, formatDate } from '../lib/calculations';
+import { formatNumber, formatDate, getRecetaAgotados } from '../lib/calculations';
 import { toISODate } from '../utils/dateUtils';
 import { Producto, AlmacenItem, Receta, IngredienteReceta } from '../types';
 import { ConfirmModal } from './ConfirmModal';
@@ -17,9 +17,8 @@ import {
   Layers,
   ArrowRight,
   Calculator,
-  Percent,
-  TrendingUp,
-  Coins,
+  AlertTriangle,
+  RefreshCw,
 } from 'lucide-react';
 
 type SubMenuTab = 'dulces' | 'recetas';
@@ -51,12 +50,16 @@ function calculatePortionCost(
     const portionInG = portionQuantity * 1000;
     return (portionInG / materialPackageSize) * materialPrice;
   }
-  if (matUnit === 'kg' && (porUnit === 'lb' || porUnit === 'libras' || porUnit === 'libra')) {
+  if (matUnit === 'kg' && (porUnit === 'lb' || porUnit === 'lbs' || porUnit === 'libras' || porUnit === 'libra')) {
     const portionInKg = portionQuantity * 0.46; // Cuban pound standard
     return (portionInKg / materialPackageSize) * materialPrice;
   }
-  if ((matUnit === 'lb' || matUnit === 'libras' || matUnit === 'libra') && porUnit === 'g') {
+  if ((matUnit === 'lb' || matUnit === 'lbs' || matUnit === 'libras' || matUnit === 'libra') && porUnit === 'g') {
     const portionInLb = portionQuantity / 460;
+    return (portionInLb / materialPackageSize) * materialPrice;
+  }
+  if ((matUnit === 'lb' || matUnit === 'lbs' || matUnit === 'libras' || matUnit === 'libra') && porUnit === 'kg') {
+    const portionInLb = portionQuantity / 0.46;
     return (portionInLb / materialPackageSize) * materialPrice;
   }
 
@@ -81,6 +84,7 @@ export const ProductsView: React.FC = () => {
   const {
     data,
     currentModule,
+    outOfStockRecetasCount,
     addProducto,
     updateProductoActivo,
     updatePrecioProducto,
@@ -140,21 +144,58 @@ export const ProductsView: React.FC = () => {
 
   // Mini-modal "Añadir Cantidades" de Material a la Receta
   const [isAddQtyMiniModalOpen, setIsAddQtyMiniModalOpen] = useState<boolean>(false);
+  const [replacingIngredienteId, setReplacingIngredienteId] = useState<string | null>(null);
   const [activeMiniTab, setActiveMiniTab] = useState<'material' | 'receta'>('material');
   const [miniSearchMaterial, setMiniSearchMaterial] = useState<string>('');
   const [selectedMatForRecipe, setSelectedMatForRecipe] = useState<AlmacenItem | null>(null);
   const [selectedRecForRecipe, setSelectedRecForRecipe] = useState<Receta | null>(null);
   const [portionQtyInput, setPortionQtyInput] = useState<string>('');
-  const [portionUnitInput, setPortionUnitInput] = useState<string>('Kg');
+  const [portionUnitInput, setPortionUnitInput] = useState<string>('g');
+  const miniSearchInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Materials list from Almacen
+  useEffect(() => {
+    if (isAddQtyMiniModalOpen) {
+      const timer = window.setTimeout(() => {
+        miniSearchInputRef.current?.focus();
+      }, 0);
+      return () => window.clearTimeout(timer);
+    }
+  }, [isAddQtyMiniModalOpen]);
+
+  // Materials list from Almacen (sorted alphabetically)
   const materiales = useMemo(() => {
-    return data.almacen || [];
+    return [...(data.almacen || [])].sort(
+      (a, b) =>
+        (a.producto || '').localeCompare(b.producto || '', 'es', { sensitivity: 'base' }) ||
+        (a.marca || '').localeCompare(b.marca || '', 'es', { sensitivity: 'base' })
+    );
   }, [data.almacen]);
+
+  // Available materials (existencia > 0) for selecting in recipes
+  const materialesDisponibles = useMemo(() => {
+    return materiales.filter((m) => (Number(m.existencia) || 0) > 0);
+  }, [materiales]);
 
   const recetas = useMemo(() => {
     return data.recetas || [];
   }, [data.recetas]);
+
+  const recetasAgotadosMap = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof getRecetaAgotados>>();
+    recetas.forEach((rec) => {
+      map.set(rec.id, getRecetaAgotados(rec, materiales, recetas));
+    });
+    return map;
+  }, [recetas, materiales]);
+
+  const recetasConAgotados = useMemo(() => {
+    return recetas
+      .map((rec) => ({
+        receta: rec,
+        agotados: recetasAgotadosMap.get(rec.id) || [],
+      }))
+      .filter((entry) => entry.agotados.length > 0);
+  }, [recetas, recetasAgotadosMap]);
 
   // Filtered recetas
   const filteredRecetas = useMemo(() => {
@@ -234,19 +275,54 @@ export const ProductsView: React.FC = () => {
 
   // Open mini-modal to pick a material and quantity
   const handleOpenAddQtyMiniModal = () => {
+    setReplacingIngredienteId(null);
     setMiniSearchMaterial('');
     setActiveMiniTab('material');
-    setSelectedMatForRecipe(materiales[0] || null);
+    setSelectedMatForRecipe(materialesDisponibles[0] || null);
     setSelectedRecForRecipe(null);
     setPortionQtyInput('');
-    setPortionUnitInput(materiales[0]?.unidad || 'Kg');
+    setPortionUnitInput('g');
+    setIsAddQtyMiniModalOpen(true);
+  };
+
+  // Open mini-modal to replace a depleted/out-of-stock ingredient with another available product
+  const handleOpenReplaceIngredienteMiniModal = (ing: IngredienteReceta) => {
+    setReplacingIngredienteId(ing.id);
+    const isRecetaIng = ing.tipo === 'receta';
+    setActiveMiniTab(isRecetaIng ? 'receta' : 'material');
+
+    if (isRecetaIng) {
+      setMiniSearchMaterial('');
+      setSelectedMatForRecipe(null);
+      setSelectedRecForRecipe(recetas.find((r) => r.id === ing.materialId) || recetas[0] || null);
+      setPortionUnitInput('unidades');
+    } else {
+      const baseName = (ing.materialNombre || '').split(' — ')[0].trim();
+      setMiniSearchMaterial(baseName);
+      const q = baseName.toLowerCase();
+      const availableMatch =
+        materialesDisponibles.find(
+          (m) =>
+            m.id !== ing.materialId &&
+            (m.producto || '').toLowerCase().includes(q)
+        ) ||
+        materialesDisponibles[0] ||
+        null;
+      setSelectedMatForRecipe(availableMatch);
+      setSelectedRecForRecipe(null);
+      setPortionUnitInput(ing.unidadMedida || 'g');
+    }
+
+    setPortionQtyInput(String(ing.cantidad || ''));
     setIsAddQtyMiniModalOpen(true);
   };
 
   const handleSelectMaterialInMiniModal = (mat: AlmacenItem) => {
     setSelectedMatForRecipe(mat);
-    setPortionQtyInput('');
-    setPortionUnitInput(mat.unidad);
+    if (!replacingIngredienteId) {
+      setPortionQtyInput('');
+      setPortionUnitInput('g');
+    }
   };
 
   // Calculated portion cost in mini-modal
@@ -278,23 +354,31 @@ export const ProductsView: React.FC = () => {
       const qty = parseFloat(portionQtyInput);
       if (isNaN(qty) || qty <= 0) return;
 
+      const matDisplayName = selectedMatForRecipe.marca
+        ? `${selectedMatForRecipe.producto} — ${selectedMatForRecipe.marca}`
+        : selectedMatForRecipe.producto;
+
       const newIngrediente: IngredienteReceta = {
-        id: `ing-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
+        id: replacingIngredienteId || `ing-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
         materialId: selectedMatForRecipe.id,
-        materialNombre: selectedMatForRecipe.producto,
+        materialNombre: matDisplayName,
         cantidad: qty,
         unidadMedida: portionUnitInput,
         costoPorcion: livePortionCost,
         tipo: 'material',
       };
-      setRecetaIngredientes((prev) => [...prev, newIngrediente]);
+      setRecetaIngredientes((prev) =>
+        replacingIngredienteId
+          ? prev.map((item) => (item.id === replacingIngredienteId ? newIngrediente : item))
+          : [...prev, newIngrediente]
+      );
     } else {
       if (!selectedRecForRecipe) return;
       const qty = parseFloat(portionQtyInput);
       if (isNaN(qty) || qty <= 0) return;
 
       const newIngrediente: IngredienteReceta = {
-        id: `ing-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
+        id: replacingIngredienteId || `ing-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
         materialId: selectedRecForRecipe.id,
         materialNombre: selectedRecForRecipe.nombre,
         cantidad: qty,
@@ -302,10 +386,26 @@ export const ProductsView: React.FC = () => {
         costoPorcion: livePortionCost,
         tipo: 'receta',
       };
-      setRecetaIngredientes((prev) => [...prev, newIngrediente]);
+      setRecetaIngredientes((prev) =>
+        replacingIngredienteId
+          ? prev.map((item) => (item.id === replacingIngredienteId ? newIngrediente : item))
+          : [...prev, newIngrediente]
+      );
     }
+    setReplacingIngredienteId(null);
     setIsAddQtyMiniModalOpen(false);
   };
+
+  const recetaModalAgotados = useMemo(() => {
+    return recetaIngredientes.filter((ing) => {
+      if (ing.tipo === 'receta') {
+        const sub = recetas.find((r) => r.id === ing.materialId);
+        return !sub || (recetasAgotadosMap.get(sub.id)?.length || 0) > 0;
+      }
+      const mat = materiales.find((m) => m.id === ing.materialId);
+      return !mat || (Number(mat.existencia) || 0) <= 0;
+    });
+  }, [recetaIngredientes, materiales, recetas, recetasAgotadosMap]);
 
   const handleRemoveIngrediente = (id: string) => {
     setRecetaIngredientes((prev) => prev.filter((i) => i.id !== id));
@@ -419,6 +519,14 @@ export const ProductsView: React.FC = () => {
             <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-white/70 text-gray-800">
               {recetas.length}
             </span>
+            {outOfStockRecetasCount > 0 && (
+              <span
+                className="px-1.5 py-0.2 rounded-full text-[10px] font-bold bg-rose-600 text-white"
+                title={`${outOfStockRecetasCount} receta(s) con material agotado`}
+              >
+                {outOfStockRecetasCount}
+              </span>
+            )}
           </button>
         </div>
 
@@ -559,6 +667,46 @@ export const ProductsView: React.FC = () => {
       {/* ========================================================= */}
       {activeTab === 'recetas' && (
         <div className="space-y-3">
+          {recetasConAgotados.length > 0 && (
+            <div className="bg-rose-50 border border-rose-200 rounded-lg p-3 shadow-2xs space-y-2">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                <div className="flex-1 min-w-0 text-xs">
+                  <div className="font-bold text-rose-900">
+                    Materiales agotados en {recetasConAgotados.length} receta(s) — Actualizar producto y costo
+                  </div>
+                  <p className="text-[11px] text-rose-800 mt-0.5">
+                    Cuando un material llega a 0 en Almacén, el costo calculado de la receta queda desactualizado. Cambia el producto agotado por otro disponible para recalcular el precio real.
+                  </p>
+                </div>
+              </div>
+
+              <div className="divide-y divide-rose-200/70 bg-white/90 border border-rose-200 rounded-md">
+                {recetasConAgotados.map(({ receta, agotados }) => (
+                  <div
+                    key={receta.id}
+                    className="px-2.5 py-1.5 flex flex-wrap items-center justify-between gap-2 text-xs"
+                  >
+                    <div className="min-w-0">
+                      <span className="font-bold text-gray-900">{receta.nombre}:</span>{' '}
+                      <span className="text-rose-700 font-medium">
+                        {agotados.map((a) => a.materialNombre).join(', ')}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleOpenEditReceta(receta)}
+                      className="px-2.5 py-1 text-[11px] font-semibold text-white bg-rose-600 hover:bg-rose-700 rounded inline-flex items-center gap-1 shrink-0 transition-colors"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                      <span>Cambiar material</span>
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           <div className="bg-white border border-gray-200 rounded-lg p-2.5 shadow-2xs flex flex-wrap items-center justify-between gap-2">
             <div className="relative">
               <Search className="w-3.5 h-3.5 absolute left-2.5 top-2 text-gray-400" />
@@ -608,20 +756,38 @@ export const ProductsView: React.FC = () => {
                   ) : (
                     filteredRecetas.map((rec, index) => {
                       const resumenIngredientes = rec.ingredientes
-                        .map((i) => `${i.materialNombre} (${i.cantidad} ${i.unidadMedida})`)
+                        .map((i) => {
+                          const mat = i.tipo !== 'receta' ? materiales.find((m) => m.id === i.materialId) : undefined;
+                          const label =
+                            mat?.marca && !i.materialNombre.includes(mat.marca)
+                              ? `${i.materialNombre} — ${mat.marca}`
+                              : i.materialNombre;
+                          return `${label} (${i.cantidad} ${i.unidadMedida})`;
+                        })
                         .join(', ');
 
                       const rinde = rec.unidadesRinde || 100;
                       const cUnit = rec.costoUnitario || (rinde > 0 ? rec.costoTotal / rinde : 0);
                       const pSug = rec.precioSugeridoUnitario || cUnit * 1.3;
+                      const recAgotados = recetasAgotadosMap.get(rec.id) || [];
+                      const hasAgotado = recAgotados.length > 0;
 
                       return (
-                        <tr key={rec.id} className="hover:bg-slate-50 transition-colors">
+                        <tr
+                          key={rec.id}
+                          className={`transition-colors ${
+                            hasAgotado
+                              ? 'bg-rose-50/85 hover:bg-rose-100/70'
+                              : 'hover:bg-slate-50'
+                          }`}
+                        >
                           <td className="py-2 px-3 text-center text-gray-400 font-mono text-[11px]">
                             {index + 1}
                           </td>
                           <td className="py-2 px-3">
-                            <span className="font-bold text-gray-900 block">{rec.nombre}</span>
+                            <span className={`font-bold block ${hasAgotado ? 'text-rose-950' : 'text-gray-900'}`}>
+                              {rec.nombre}
+                            </span>
                             {(rec.notas || rec.observaciones) && (
                               <span className="text-[11px] text-gray-500 italic block">
                                 {rec.notas || rec.observaciones}
@@ -635,6 +801,14 @@ export const ProductsView: React.FC = () => {
                             <span className="text-[10px] text-gray-400">
                               {rec.ingredientes.length} ingrediente(s)
                             </span>
+                            {hasAgotado && (
+                              <div className="text-[10px] font-bold text-rose-700 mt-0.5 flex items-center gap-1">
+                                <AlertTriangle className="w-3 h-3 shrink-0" />
+                                <span>
+                                  Agotado ({recAgotados.map((a) => a.materialNombre).join(', ')}) — cambiar producto
+                                </span>
+                              </div>
+                            )}
                           </td>
                           <td className="py-2 px-3 text-center font-medium text-gray-800">
                             <span className="px-2 py-0.5 rounded-full text-[11px] bg-amber-50 text-amber-900 border border-amber-200">
@@ -696,9 +870,9 @@ export const ProductsView: React.FC = () => {
       {/* MODAL: AGREGAR / EDITAR RECETA                            */}
       {/* ========================================================= */}
       {isRecetaModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 bg-black/50 backdrop-blur-xs animate-in fade-in duration-150">
-          <div className="bg-white rounded-lg shadow-xl max-w-lg w-full p-4 space-y-3 text-xs max-h-[92vh] overflow-y-auto">
-            <div className="flex items-center justify-between border-b border-gray-100 pb-2">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-black/50 backdrop-blur-xs animate-in fade-in duration-150">
+          <div className="bg-white rounded-lg shadow-xl max-w-lg w-full flex flex-col max-h-[calc(100dvh-1.5rem)] overflow-hidden text-xs">
+            <div className="shrink-0 flex items-center justify-between border-b border-gray-100 px-4 py-3 bg-white">
               <h3 className="font-bold text-sm text-gray-900">
                 {editingRecetaId ? 'Editar Receta' : 'Agregar Receta'}
               </h3>
@@ -711,7 +885,8 @@ export const ProductsView: React.FC = () => {
               </button>
             </div>
 
-            <form onSubmit={handleSaveReceta} className="space-y-3.5">
+            <form onSubmit={handleSaveReceta} className="flex flex-col flex-1 min-h-0">
+              <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-4 space-y-3.5">
               {/* 1. Nombre de la receta en la parte superior */}
               <div>
                 <label className="font-semibold text-gray-700 block mb-1">
@@ -751,6 +926,15 @@ export const ProductsView: React.FC = () => {
                   </span>
                 </div>
 
+                {recetaModalAgotados.length > 0 && (
+                  <div className="mb-2 p-2 bg-rose-50 border border-rose-200 rounded-md flex items-center gap-2 text-[11px] text-rose-800">
+                    <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                    <span>
+                      Hay <strong>{recetaModalAgotados.length} material(es) agotado(s)</strong> en esta receta. Pulsa <strong>Cambiar</strong> para elegir otro producto o marca disponible y recalcular el costo real.
+                    </span>
+                  </div>
+                )}
+
                 <div className="border border-gray-200 rounded-md overflow-hidden bg-white max-h-44 overflow-y-auto">
                   {recetaIngredientes.length === 0 ? (
                     <div className="py-5 text-center text-gray-400">
@@ -766,14 +950,32 @@ export const ProductsView: React.FC = () => {
                           <th className="py-1.5 px-2">Material</th>
                           <th className="py-1.5 px-2 text-right">Porción Usada</th>
                           <th className="py-1.5 px-2 text-right">Importe de la Porción</th>
-                          <th className="py-1.5 px-1 w-8 text-center"></th>
+                          <th className="py-1.5 px-2 w-24 text-center">Acción</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-gray-100">
-                        {recetaIngredientes.map((ing) => (
-                          <tr key={ing.id} className="hover:bg-slate-50">
+                        {recetaIngredientes.map((ing) => {
+                          const mat = ing.tipo !== 'receta' ? materiales.find((m) => m.id === ing.materialId) : undefined;
+                          const subRec = ing.tipo === 'receta' ? recetas.find((r) => r.id === ing.materialId) : undefined;
+                          const isIngAgotado = ing.tipo === 'receta'
+                            ? !subRec || (recetasAgotadosMap.get(subRec.id)?.length || 0) > 0
+                            : !mat || (Number(mat.existencia) || 0) <= 0;
+                          const ingLabel =
+                            mat?.marca && !ing.materialNombre.includes(mat.marca)
+                              ? `${ing.materialNombre} — ${mat.marca}`
+                              : ing.materialNombre;
+                          return (
+                          <tr
+                            key={ing.id}
+                            className={isIngAgotado ? 'bg-rose-50/90 hover:bg-rose-100/70' : 'hover:bg-slate-50'}
+                          >
                             <td className="py-1.5 px-2 font-semibold text-gray-900">
-                              {ing.materialNombre}
+                              <div>{ingLabel}</div>
+                              {isIngAgotado && (
+                                <span className="text-[10px] font-bold text-rose-700 block">
+                                  Agotado en Almacén — cambiar producto
+                                </span>
+                              )}
                             </td>
                             <td className="py-1.5 px-2 text-right text-gray-700 font-medium">
                               {ing.cantidad} {ing.unidadMedida}
@@ -782,17 +984,33 @@ export const ProductsView: React.FC = () => {
                               {formatNumber(ing.costoPorcion)}
                             </td>
                             <td className="py-1.5 px-1 text-center">
-                              <button
-                                type="button"
-                                onClick={() => handleRemoveIngrediente(ing.id)}
-                                className="p-1 text-gray-400 hover:text-rose-600 rounded"
-                                title="Eliminar de la receta"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
+                              <div className="flex items-center justify-center gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenReplaceIngredienteMiniModal(ing)}
+                                  className={`px-1.5 py-0.5 text-[10px] font-semibold rounded inline-flex items-center gap-0.5 transition-colors ${
+                                    isIngAgotado
+                                      ? 'bg-rose-600 text-white hover:bg-rose-700'
+                                      : 'bg-slate-100 text-slate-700 hover:bg-amber-100 hover:text-amber-900'
+                                  }`}
+                                  title="Cambiar material o porción"
+                                >
+                                  <RefreshCw className="w-2.5 h-2.5" />
+                                  <span>Cambiar</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleRemoveIngrediente(ing.id)}
+                                  className="p-1 text-gray-400 hover:text-rose-600 rounded"
+                                  title="Eliminar de la receta"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
                             </td>
                           </tr>
-                        ))}
+                          );
+                        })}
                       </tbody>
                     </table>
                   )}
@@ -949,11 +1167,13 @@ export const ProductsView: React.FC = () => {
                 />
               </div>
 
-              <div className="flex justify-end gap-2 pt-2 border-t border-gray-100">
+              </div>
+
+              <div className="shrink-0 flex justify-end gap-2 px-4 py-2.5 border-t border-gray-100 bg-slate-50">
                 <button
                   type="button"
                   onClick={() => setIsRecetaModalOpen(false)}
-                  className="px-3 py-1.5 font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded"
+                  className="px-3 py-1.5 font-medium text-gray-700 bg-white border border-gray-300 hover:bg-gray-100 rounded"
                 >
                   Cancelar
                 </button>
@@ -974,16 +1194,25 @@ export const ProductsView: React.FC = () => {
       {/* MINI-MODAL: AÑADIR CANTIDADES DE MATERIAL A LA RECETA     */}
       {/* ========================================================= */}
       {isAddQtyMiniModalOpen && (
-        <div className="fixed inset-0 z-60 flex items-center justify-center p-3 bg-black/60 backdrop-blur-xs animate-in fade-in duration-150">
-          <div className="bg-white rounded-lg shadow-2xl max-w-md w-full p-4 space-y-3 text-xs">
+        <div className="fixed inset-0 z-60 flex items-center justify-center p-2 sm:p-3 bg-black/60 backdrop-blur-xs animate-in fade-in duration-150">
+          <div className="bg-white rounded-lg shadow-2xl max-w-md w-full p-4 space-y-3 text-xs max-h-[calc(100dvh-1.5rem)] overflow-y-auto">
             <div className="flex items-center justify-between border-b border-gray-100 pb-2">
               <h4 className="font-bold text-sm text-gray-900 flex items-center gap-1.5">
-                <Calculator className="w-4 h-4 text-amber-600" />
-                <span>Seleccionar Material y Porción</span>
+                {replacingIngredienteId ? (
+                  <RefreshCw className="w-4 h-4 text-rose-600" />
+                ) : (
+                  <Calculator className="w-4 h-4 text-amber-600" />
+                )}
+                <span>
+                  {replacingIngredienteId ? 'Cambiar Material en la Receta' : 'Seleccionar Material y Porción'}
+                </span>
               </h4>
               <button
                 type="button"
-                onClick={() => setIsAddQtyMiniModalOpen(false)}
+                onClick={() => {
+                  setReplacingIngredienteId(null);
+                  setIsAddQtyMiniModalOpen(false);
+                }}
                 className="text-gray-400 hover:text-gray-600 text-sm"
               >
                 ✕
@@ -994,20 +1223,26 @@ export const ProductsView: React.FC = () => {
             <div className="space-y-2">
               <div className="flex bg-gray-100 rounded-lg p-1 text-xs font-semibold">
                 <button
+                  type="button"
                   onClick={() => {
                     setActiveMiniTab('material');
-                    setSelectedMatForRecipe(materiales[0] || null);
+                    setSelectedMatForRecipe(materialesDisponibles[0] || null);
                     setSelectedRecForRecipe(null);
+                    setPortionUnitInput('g');
+                    setPortionQtyInput('');
                   }}
                   className={`flex-1 py-1 rounded ${activeMiniTab === 'material' ? 'bg-white shadow text-amber-900' : 'text-gray-500'}`}
                 >
                   Materiales
                 </button>
                 <button
+                  type="button"
                   onClick={() => {
                     setActiveMiniTab('receta');
                     setSelectedRecForRecipe(recetas[0] || null);
                     setSelectedMatForRecipe(null);
+                    setPortionUnitInput('unidades');
+                    setPortionQtyInput('');
                   }}
                   className={`flex-1 py-1 rounded ${activeMiniTab === 'receta' ? 'bg-white shadow text-amber-900' : 'text-gray-500'}`}
                 >
@@ -1022,8 +1257,14 @@ export const ProductsView: React.FC = () => {
               <div className="relative">
                 <Search className="w-3.5 h-3.5 absolute left-2 top-2 text-gray-400" />
                 <input
+                  ref={miniSearchInputRef}
                   type="text"
-                  placeholder="Buscar..."
+                  autoFocus
+                  placeholder={
+                    activeMiniTab === 'material'
+                      ? 'Buscar por nombre o marca...'
+                      : 'Buscar receta...'
+                  }
                   value={miniSearchMaterial}
                   onChange={(e) => setMiniSearchMaterial(e.target.value)}
                   className="w-full h-7 pl-7 pr-2 text-xs border border-gray-300 rounded focus:ring-1 focus:ring-amber-500"
@@ -1031,53 +1272,75 @@ export const ProductsView: React.FC = () => {
               </div>
 
               <div className="border border-gray-200 rounded max-h-36 overflow-y-auto divide-y divide-gray-100 bg-slate-50/50">
-                {(activeMiniTab === 'material' ? materiales : recetas)
-                  .filter((m) => {
+                {(() => {
+                  const filteredMiniItems = (activeMiniTab === 'material' ? materialesDisponibles : recetas).filter((m) => {
                     if (!miniSearchMaterial.trim()) return true;
-                    const label =
-                      activeMiniTab === 'material'
-                        ? (m as AlmacenItem).producto
-                        : (m as Receta).nombre;
-                    return label.toLowerCase().includes(miniSearchMaterial.toLowerCase());
-                  })
-                  .map((item) => {
+                    const q = miniSearchMaterial.trim().toLowerCase();
+                    if (activeMiniTab === 'material') {
+                      const mat = m as AlmacenItem;
+                      const combined = `${mat.producto || ''} ${mat.marca || ''}`.toLowerCase();
+                      return combined.includes(q);
+                    }
+                    return ((m as Receta).nombre || '').toLowerCase().includes(q);
+                  });
+
+                  if (filteredMiniItems.length === 0) {
+                    return (
+                      <div className="p-3 text-center text-[11px] text-gray-500">
+                        {activeMiniTab === 'material'
+                          ? 'No hay materiales disponibles con existencia en Almacén.'
+                          : 'No se encontraron recetas.'}
+                      </div>
+                    );
+                  }
+
+                  return filteredMiniItems.map((item) => {
                     const isSelected =
                       activeMiniTab === 'material'
                         ? selectedMatForRecipe?.id === item.id
                         : selectedRecForRecipe?.id === item.id;
-                    const itemTitle =
-                      activeMiniTab === 'material'
-                        ? (item as AlmacenItem).producto
-                        : (item as Receta).nombre;
+                    const matItem = activeMiniTab === 'material' ? (item as AlmacenItem) : null;
+                    const itemTitle = matItem
+                      ? matItem.producto
+                      : (item as Receta).nombre;
                     return (
                       <div
                         key={item.id}
                         onClick={() => {
                           if (activeMiniTab === 'material') {
-                            const alm = item as AlmacenItem;
-                            setSelectedMatForRecipe(alm);
-                            setPortionUnitInput(alm.unidad);
+                            handleSelectMaterialInMiniModal(item as AlmacenItem);
                           } else {
                             setSelectedRecForRecipe(item as Receta);
                             setPortionUnitInput('unidades');
+                            if (!replacingIngredienteId) setPortionQtyInput('');
                           }
-                          setPortionQtyInput('');
                         }}
                         className={`p-2 flex items-center justify-between cursor-pointer transition-colors ${
-                          isSelected ? 'bg-amber-100/70 border-l-4 border-amber-600' : 'hover:bg-white'
+                          isSelected
+                            ? 'bg-amber-100/70 border-l-4 border-amber-600'
+                            : 'hover:bg-white'
                         }`}
                       >
-                        <div>
-                          <span className="font-bold text-gray-900">{itemTitle}</span>
+                        <div className="min-w-0 pr-2">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="font-bold text-gray-900">
+                              {itemTitle}
+                            </span>
+                            {matItem?.marca && (
+                              <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-slate-200/80 text-slate-800 border border-slate-300/70">
+                                {matItem.marca}
+                              </span>
+                            )}
+                          </div>
                           <div className="text-[10px] text-gray-500">
-                            {activeMiniTab === 'material'
-                              ? `Existencia: ${(item as AlmacenItem).existencia} ${(item as AlmacenItem).unidad} — ${formatNumber((item as AlmacenItem).precio)}`
+                            {matItem
+                              ? `Existencia: ${formatNumber(matItem.existencia)} ${matItem.unidad}`
                               : `Costo: ${formatNumber((item as Receta).costoTotal)} — Rendimiento: ${(item as Receta).unidadesRinde || 100} u.`}
                           </div>
                         </div>
                         <button
                           type="button"
-                          className={`w-6 h-6 rounded flex items-center justify-center font-bold text-xs ${
+                          className={`w-6 h-6 shrink-0 rounded flex items-center justify-center font-bold text-xs ${
                             isSelected
                               ? 'bg-amber-600 text-white'
                               : 'bg-white border border-gray-300 text-gray-700 hover:bg-amber-50 hover:text-amber-700'
@@ -1087,20 +1350,28 @@ export const ProductsView: React.FC = () => {
                         </button>
                       </div>
                     );
-                  })}
+                  });
+                })()}
               </div>
             </div>
 
             {/* Configurar cantidad a usar en la receta */}
             {(activeMiniTab === 'material' ? selectedMatForRecipe : selectedRecForRecipe) && (
               <div className="p-3 bg-amber-50/60 border border-amber-200 rounded-lg space-y-2.5">
-                <div className="font-bold text-gray-900 text-xs flex items-center justify-between">
+                <div className="font-bold text-gray-900 text-xs flex items-center justify-between gap-2">
                   <span>
                     Seleccionado:{' '}
                     {activeMiniTab === 'material'
-                      ? selectedMatForRecipe?.producto
+                      ? `${selectedMatForRecipe?.producto || ''}${selectedMatForRecipe?.marca ? ` — ${selectedMatForRecipe.marca}` : ''}`
                       : selectedRecForRecipe?.nombre}
                   </span>
+                  {activeMiniTab === 'material' &&
+                    selectedMatForRecipe &&
+                    (Number(selectedMatForRecipe.existencia) || 0) <= 0 && (
+                      <span className="text-[10px] font-bold text-rose-700 uppercase shrink-0">
+                        Agotado en almacén
+                      </span>
+                    )}
                 </div>
 
                 <div className="grid grid-cols-2 gap-2">
@@ -1113,7 +1384,6 @@ export const ProductsView: React.FC = () => {
                       step="any"
                       min="0.001"
                       required
-                      autoFocus
                       placeholder="Ej. 5"
                       value={portionQtyInput}
                       onChange={(e) => setPortionQtyInput(e.target.value)}
@@ -1133,8 +1403,8 @@ export const ProductsView: React.FC = () => {
                         >
                           {selectedMatForRecipe?.unidad?.toLowerCase() === 'kg' ? (
                             <>
-                              <option value="Kg">Kg</option>
                               <option value="g">g (gramos)</option>
+                              <option value="Kg">Kg</option>
                               <option value="lb">lb (libras)</option>
                             </>
                           ) : selectedMatForRecipe?.unidad?.toLowerCase() === 'g' ? (
@@ -1142,14 +1412,37 @@ export const ProductsView: React.FC = () => {
                               <option value="g">g (gramos)</option>
                               <option value="Kg">Kg</option>
                             </>
-                          ) : selectedMatForRecipe?.unidad?.toLowerCase() === 'l' ? (
+                          ) : selectedMatForRecipe?.unidad?.toLowerCase() === 'lb' ||
+                            selectedMatForRecipe?.unidad?.toLowerCase() === 'lbs' ||
+                            selectedMatForRecipe?.unidad?.toLowerCase() === 'libra' ||
+                            selectedMatForRecipe?.unidad?.toLowerCase() === 'libras' ? (
                             <>
-                              <option value="L">L (litros)</option>
+                              <option value="g">g (gramos)</option>
+                              <option value="lb">lb (libras)</option>
+                              <option value="Kg">Kg</option>
+                            </>
+                          ) : selectedMatForRecipe?.unidad?.toLowerCase() === 'l' ||
+                            selectedMatForRecipe?.unidad?.toLowerCase() === 'litro' ||
+                            selectedMatForRecipe?.unidad?.toLowerCase() === 'litros' ? (
+                            <>
+                              <option value="g">g (gramos)</option>
                               <option value="ml">ml (mililitros)</option>
+                              <option value="L">L (litros)</option>
+                            </>
+                          ) : selectedMatForRecipe?.unidad?.toLowerCase() === 'ml' ? (
+                            <>
+                              <option value="g">g (gramos)</option>
+                              <option value="ml">ml (mililitros)</option>
+                              <option value="L">L (litros)</option>
                             </>
                           ) : (
                             <>
-                              <option value={selectedMatForRecipe?.unidad}>{selectedMatForRecipe?.unidad}</option>
+                              <option value="g">g (gramos)</option>
+                              {selectedMatForRecipe?.unidad && (
+                                <option value={selectedMatForRecipe.unidad}>
+                                  {selectedMatForRecipe.unidad}
+                                </option>
+                              )}
                               <option value="Unidades">Unidades</option>
                             </>
                           )}
@@ -1175,7 +1468,10 @@ export const ProductsView: React.FC = () => {
             <div className="flex justify-end gap-2 pt-2 border-t border-gray-100">
               <button
                 type="button"
-                onClick={() => setIsAddQtyMiniModalOpen(false)}
+                onClick={() => {
+                  setReplacingIngredienteId(null);
+                  setIsAddQtyMiniModalOpen(false);
+                }}
                 className="px-3 py-1.5 font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded"
               >
                 Cancelar
@@ -1190,7 +1486,9 @@ export const ProductsView: React.FC = () => {
                 onClick={handleAddPortionToRecipe}
                 className="px-4 py-1.5 font-semibold text-white bg-amber-600 hover:bg-amber-700 disabled:opacity-40 rounded flex items-center gap-1.5 transition-colors shadow-2xs"
               >
-                <span>Añadir cantidad a la receta</span>
+                <span>
+                  {replacingIngredienteId ? 'Reemplazar en la receta' : 'Añadir cantidad a la receta'}
+                </span>
                 <ArrowRight className="w-3.5 h-3.5" />
               </button>
             </div>
@@ -1225,6 +1523,20 @@ export const ProductsView: React.FC = () => {
               </p>
             )}
 
+            {(recetasAgotadosMap.get(viewingReceta.id)?.length || 0) > 0 && (
+              <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-lg flex items-start gap-2 text-[11px] text-rose-800">
+                <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-bold text-rose-900 block">
+                    Esta receta tiene materiales agotados en Almacén
+                  </span>
+                  <span>
+                    Cambia el producto agotado por otro disponible para actualizar el costo y precio sugerido.
+                  </span>
+                </div>
+              </div>
+            )}
+
             <div className="border border-gray-200 rounded overflow-hidden">
               <table className="w-full text-left text-xs border-collapse">
                 <thead className="bg-slate-50 border-b border-gray-200 text-gray-600">
@@ -1235,9 +1547,26 @@ export const ProductsView: React.FC = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100">
-                  {viewingReceta.ingredientes.map((ing, i) => (
-                    <tr key={i} className="hover:bg-slate-50">
-                      <td className="py-2 px-2.5 font-medium text-gray-900">{ing.materialNombre}</td>
+                  {viewingReceta.ingredientes.map((ing, i) => {
+                    const mat = ing.tipo !== 'receta' ? materiales.find((m) => m.id === ing.materialId) : undefined;
+                    const subRec = ing.tipo === 'receta' ? recetas.find((r) => r.id === ing.materialId) : undefined;
+                    const isIngAgotado = ing.tipo === 'receta'
+                      ? !subRec || (recetasAgotadosMap.get(subRec.id)?.length || 0) > 0
+                      : !mat || (Number(mat.existencia) || 0) <= 0;
+                    const ingLabel =
+                      mat?.marca && !ing.materialNombre.includes(mat.marca)
+                        ? `${ing.materialNombre} — ${mat.marca}`
+                        : ing.materialNombre;
+                    return (
+                    <tr key={i} className={isIngAgotado ? 'bg-rose-50/80' : 'hover:bg-slate-50'}>
+                      <td className="py-2 px-2.5 font-medium text-gray-900">
+                        <div>{ingLabel}</div>
+                        {isIngAgotado && (
+                          <span className="text-[10px] font-bold text-rose-700">
+                            Agotado — requiere cambio
+                          </span>
+                        )}
+                      </td>
                       <td className="py-2 px-2.5 text-right text-gray-700">
                         {ing.cantidad} {ing.unidadMedida}
                       </td>
@@ -1245,7 +1574,8 @@ export const ProductsView: React.FC = () => {
                         {formatNumber(ing.costoPorcion)}
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -1319,7 +1649,21 @@ export const ProductsView: React.FC = () => {
               </div>
             </div>
 
-            <div className="flex justify-end pt-2 border-t border-gray-100">
+            <div className="flex justify-end gap-2 pt-2 border-t border-gray-100">
+              {(recetasAgotadosMap.get(viewingReceta.id)?.length || 0) > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const target = viewingReceta;
+                    setViewingReceta(null);
+                    handleOpenEditReceta(target);
+                  }}
+                  className="px-3 py-1.5 font-semibold text-white bg-rose-600 hover:bg-rose-700 rounded inline-flex items-center gap-1 transition-colors"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Cambiar material</span>
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => setViewingReceta(null)}

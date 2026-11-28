@@ -3,7 +3,6 @@ export type ModuleName =
   | 'Producción'
   | 'Ventas'
   | 'Facturación'
-  | 'Reportes'
   | 'Gastos'
   | 'Caja'
   | 'Almacén'

@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useMemo, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useEffect, useMemo, useRef, ReactNode } from 'react';
 import initialJson from '../data/datos_tatao.json';
 import {
   AppData,
@@ -14,12 +14,43 @@ import {
   JustificacionDiferencia,
   Receta,
   UsuarioAutorizado,
+  MetaConfig,
 } from '../types';
 import { getDefaultDateRange, getQuickRange, QuickDatePreset } from '../utils/dateUtils';
-import { getPrecioVigente, getPagoPorDulce, calculateReparto, calculateReconciliation } from '../lib/calculations';
+import {
+  getPrecioVigente,
+  getPagoPorDulce,
+  calculateReparto,
+  calculateReconciliation,
+  getRecetaAgotados,
+} from '../lib/calculations';
+import { useAuth } from './AuthContext';
+import {
+  buildAllowedEmails,
+  checkUserAccess,
+  fetchAllFirestoreFromServer,
+  fsDeleteEntity,
+  fsDeleteProduccionAndGastos,
+  fsDeshacerRepartoPagado,
+  fsSaveClienteAndRefs,
+  fsSaveConfigMeta,
+  fsSaveProduccionAndGasto,
+  fsSaveReglasReparto,
+  fsSaveRepartoPagado,
+  fsSaveUsuarioAndSyncAllowedEmails,
+  fsSaveVentaAndNextVale,
+  fsSetEntity,
+  isPrimaryAdminEmail,
+  replaceAllFirestoreData,
+  seedFirestoreIfNeeded,
+  subscribeToFirestoreData,
+} from '../lib/firestoreStore';
 
 const STORAGE_KEY = 'dulceria_tatao_data_v2';
 const NOTES_KEY = 'dulceria_tatao_reconciliation_note';
+
+type AccessStatus = 'loading' | 'unauthenticated' | 'authorized' | 'denied';
+type UserRole = 'Administrador' | 'Operador' | 'Lector';
 
 interface AppContextType {
   data: AppData;
@@ -32,8 +63,15 @@ interface AppContextType {
   reconciliationNote: string;
   saveReconciliationNote: (note: string) => void;
 
-  // Contador global de alertas pendientes
+  // Estado de acceso y Firestore
+  accessStatus: AccessStatus;
+  currentUserRole: UserRole | null;
+  isFirestoreReady: boolean;
+
+  // Contador global de alertas pendientes, repartos pendientes y recetas con material agotado
   pendingAlertsCount: number;
+  pendingRepartosCount: number;
+  outOfStockRecetasCount: number;
 
   // Justificaciones de diferencias
   justificaciones: JustificacionDiferencia[];
@@ -104,9 +142,6 @@ interface AppContextType {
     desde: string
   ) => void;
 
-  // MaterialReceta is now derived directly from Almacen and is read-only.
-  // Manual additions, updates, or deletions are not supported in this submenu.
-
   // Submenú 2: Recetas
   addReceta: (rec: Omit<Receta, 'id'>) => void;
   updateReceta: (id: string, rec: Partial<Receta>) => void;
@@ -145,6 +180,18 @@ interface AppContextType {
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
+function datasetScore(d: Partial<AppData> | null | undefined): number {
+  if (!d) return 0;
+  return (
+    (d.ventas?.length || 0) +
+    (d.produccion?.length || 0) +
+    (d.gastos?.length || 0) +
+    (d.almacen?.length || 0) +
+    (d.recetas?.length || 0) * 3 +
+    (d.facturas?.filter((f) => !f.id?.startsWith('fac-vale-')).length || 0) * 2
+  );
+}
+
 // Normalization helper
 function normalizeData(raw: Partial<AppData> | null | undefined): AppData {
   const init = initialJson as unknown as AppData;
@@ -161,68 +208,57 @@ function normalizeData(raw: Partial<AppData> | null | undefined): AppData {
     return name;
   };
 
-  const normClients = rawClients.map((c) => ({
-    ...c,
-    nombre: normalizeClientName(c.nombre),
-  }));
+  const normClients = [...rawClients]
+    .map((c) => ({
+      ...c,
+      nombre: normalizeClientName(c.nombre),
+    }))
+    .sort((a, b) => (a.nombre || '').localeCompare(b.nombre || '', 'es', { sensitivity: 'base' }));
 
-  const normVentas = rawVentas.map((v) => ({
-    ...v,
-    cliente: normalizeClientName(v.cliente),
-    formaPago: v.formaPago || 'Efectivo',
-  }));
+  const normVentas = [...rawVentas]
+    .map((v) => ({
+      ...v,
+      cliente: normalizeClientName(v.cliente),
+      formaPago: v.formaPago || 'Efectivo',
+    }))
+    .sort((a, b) => {
+      const fCmp = (b.fecha || '').localeCompare(a.fecha || '');
+      if (fCmp !== 0) return fCmp;
+      return (parseInt(b.vale, 10) || 0) - (parseInt(a.vale, 10) || 0);
+    });
 
-  let normFacturas: FacturaItem[] = Array.isArray(raw.facturas)
-    ? raw.facturas.map((f) => ({
-        ...f,
-        cliente: normalizeClientName(f.cliente),
-      }))
-    : [];
-  // Auto-generate invoices for historical vales from September 21, 2026 if empty
-  if (normFacturas.length === 0 && normVentas.length > 0) {
-    normFacturas = normVentas
-      .filter((v) => v.fecha >= '2026-09-21')
-      .map((v) => {
-        const cli = normClients.find((c) => c.nombre === v.cliente);
-        return {
-          id: `fac-vale-${v.vale}-${v.id}`,
-          numero: v.vale,
-          cliente: v.cliente,
-          telefono: cli?.telefono || '',
-          ci: cli?.ci || '',
-          direccion: cli?.direccion || '',
-          fecha: v.fecha,
-          periodoVales: v.fecha,
-          valesIncluidos: [v.id],
-          valesDetalle: [
-            {
-              vale: v.vale,
-              fecha: v.fecha,
-              detalle: v.lineas.map((l) => `${l.producto} (${l.cantidad})`).join(', '),
-              importe: v.importeTotal,
-            },
-          ],
-          productosConsolidados: v.lineas.map((l) => ({
-            producto: l.producto,
-            cantidad: l.cantidad,
-            precioUnitario: l.cantidad > 0 ? l.importe / l.cantidad : 0,
-            importe: l.importe,
-          })),
-          importeTotal: v.importeTotal,
-          observaciones: `Factura correspondiente al vale ${v.vale}`,
-        };
-      });
-  }
+  const normFacturas: FacturaItem[] = (Array.isArray(raw.facturas) ? raw.facturas : [])
+    .filter((f) => !f.id?.startsWith('fac-vale-'))
+    .map((f) => ({
+      ...f,
+      cliente: normalizeClientName(f.cliente),
+    }))
+    .sort((a, b) => (b.fecha || '').localeCompare(a.fecha || '') || (b.numero || '').localeCompare(a.numero || ''));
 
+  const normProduccion = [...(Array.isArray(raw.produccion) ? raw.produccion : init.produccion || [])].sort(
+    (a, b) => (b.fecha || '').localeCompare(a.fecha || '') || (b.id || '').localeCompare(a.id || '')
+  );
 
-  const normRecetas = Array.isArray(raw.recetas) ? raw.recetas : [];
+  const normGastos = [...(Array.isArray(raw.gastos) ? raw.gastos : init.gastos || [])].sort(
+    (a, b) => (b.fecha || '').localeCompare(a.fecha || '') || (b.id || '').localeCompare(a.id || '')
+  );
+
+  const normRepartos = [...(Array.isArray(raw.repartos) ? raw.repartos : init.repartos || [])].sort((a, b) =>
+    (a.desde || '').localeCompare(b.desde || '')
+  );
+
+  const normRecetas = [...(Array.isArray(raw.recetas) ? raw.recetas : [])].sort((a, b) =>
+    (b.fechaCreacion || '').localeCompare(a.fechaCreacion || '') ||
+    (a.nombre || '').localeCompare(b.nombre || '', 'es', { sensitivity: 'base' })
+  );
 
   // Migrate Almacen to include price
-  const normAlmacen: AlmacenItem[] = (Array.isArray(raw.almacen) ? raw.almacen : init.almacen || []).map(a => ({
-    ...a,
-    precio: a.precio || 0 // Ensure price exists
-  }));
-
+  const normAlmacen: AlmacenItem[] = [...(Array.isArray(raw.almacen) ? raw.almacen : init.almacen || [])]
+    .map((a) => ({
+      ...a,
+      precio: a.precio || 0,
+    }))
+    .sort((a, b) => (a.codigo || '').localeCompare(b.codigo || ''));
 
   const defaultUsuarios: UsuarioAutorizado[] = [
     {
@@ -241,37 +277,54 @@ function normalizeData(raw: Partial<AppData> | null | undefined): AppData {
       : defaultUsuarios;
 
   const rawProductos = Array.isArray(raw.productos) ? raw.productos : init.productos || [];
-  const normProductos: Producto[] = rawProductos.map((p) => ({
-    ...p,
-    activo: p.activo !== false,
-  }));
+  const normProductos: Producto[] = [...rawProductos]
+    .map((p) => ({
+      ...p,
+      activo: p.activo !== false,
+    }))
+    .sort((a, b) => (a.nombre || '').localeCompare(b.nombre || '', 'es', { sensitivity: 'base' }));
+
+  const normJustificaciones = [...(Array.isArray(raw.justificaciones) ? raw.justificaciones : [])].sort((a, b) =>
+    (b.fechaRegistro || '').localeCompare(a.fechaRegistro || '')
+  );
 
   return {
     meta: raw.meta || init.meta,
-    repartos: Array.isArray(raw.repartos) ? raw.repartos : init.repartos || [],
+    repartos: normRepartos,
     clientes: normClients,
     productos: normProductos,
-    produccion: Array.isArray(raw.produccion) ? raw.produccion : init.produccion || [],
+    produccion: normProduccion,
     ventas: normVentas,
-    gastos: Array.isArray(raw.gastos) ? raw.gastos : init.gastos || [],
+    gastos: normGastos,
     almacen: normAlmacen,
     facturas: normFacturas,
     caja: raw.caja || init.caja,
-    justificaciones: Array.isArray(raw.justificaciones) ? raw.justificaciones : [],
+    justificaciones: normJustificaciones,
     recetas: normRecetas,
     usuariosAutorizados: normUsuarios,
   };
 }
 
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  // Cloud Sync & 30-minute Auto-Sync State
+  const { user, loading: authLoading } = useAuth();
+
+  const [accessStatus, setAccessStatus] = useState<AccessStatus>('loading');
+  const [currentUserRole, setCurrentUserRole] = useState<UserRole | null>(null);
+  const [isFirestoreReady, setIsFirestoreReady] = useState<boolean>(false);
+  const [fatalError, setFatalError] = useState<Error | null>(null);
+
+  if (fatalError) {
+    throw fatalError;
+  }
+
+  // Cloud Sync State
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
   const [lastCloudSync, setLastCloudSync] = useState<Date | null>(() => {
     try {
       const s = localStorage.getItem('dulceria_tatao_last_sync');
-      return s ? new Date(s) : new Date();
+      return s ? new Date(s) : null;
     } catch {
-      return new Date();
+      return null;
     }
   });
   const [syncStatusMessage, setSyncStatusMessage] = useState<{
@@ -282,40 +335,21 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     active: boolean;
     secondsLeft: number;
   } | null>(null);
-  const [isAutoSyncEnabled, setIsAutoSyncEnabledState] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem('dulceria_tatao_auto_sync') !== 'false';
-    } catch {
-      return true;
-    }
-  });
+  const [isAutoSyncEnabled, setIsAutoSyncEnabledState] = useState<boolean>(true);
   const [isCloudSyncModalOpen, setIsCloudSyncModalOpen] = useState<boolean>(false);
-  const [nextAutoSyncTime, setNextAutoSyncTime] = useState<number>(() => Date.now() + 30 * 60 * 1000);
 
   const setIsAutoSyncEnabled = (enabled: boolean) => {
     setIsAutoSyncEnabledState(enabled);
-    try {
-      localStorage.setItem('dulceria_tatao_auto_sync', String(enabled));
-    } catch (e) {
-      console.error(e);
-    }
   };
 
-  // Load data from localStorage or default to datos_tatao.json
+  // Initial local cache load for instant paint
   const [data, setData] = useState<AppData>(() => {
     let result: AppData;
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) {
         const parsed = JSON.parse(saved);
-        const normSaved = normalizeData(parsed);
-        const init = initialJson as unknown as AppData;
-        // Prefer freshly updated file if it contains more records than old cached localStorage
-        if ((init.ventas?.length || 0) > (normSaved.ventas?.length || 0)) {
-          result = normalizeData(init);
-        } else {
-          result = normSaved;
-        }
+        result = normalizeData(parsed);
       } else {
         result = normalizeData(initialJson as unknown as AppData);
       }
@@ -324,242 +358,263 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       result = normalizeData(initialJson as unknown as AppData);
     }
 
-    // Check if separate justificaciones key exists
     try {
       const savedJust = localStorage.getItem('dulceria_tatao_justificaciones');
       if (savedJust) {
         const parsedJust = JSON.parse(savedJust);
-        if (Array.isArray(parsedJust) && parsedJust.length > 0) {
+        if (Array.isArray(parsedJust) && parsedJust.length > 0 && (!result.justificaciones || result.justificaciones.length === 0)) {
           result.justificaciones = parsedJust;
         }
       }
-    } catch (e) {
-      console.error('Error loading justificaciones', e);
-    }
+    } catch {}
 
     return result;
   });
 
-  const isHydratedRef = React.useRef<boolean>(false);
+  const dataRef = useRef<AppData>(data);
+  dataRef.current = data;
 
-  // Save data to localStorage and sync with Cloud SQL PostgreSQL backend
+  const showToast = (type: 'success' | 'error' | 'info', text: string, ms = 4500) => {
+    setSyncStatusMessage({ type, text });
+    window.setTimeout(() => setSyncStatusMessage(null), ms);
+  };
+
+  // Gather richest available local/legacy dataset when seeding an empty Firestore DB
+  const gatherBestInitialDataset = async (): Promise<AppData> => {
+    let best = normalizeData(initialJson as unknown as AppData);
+
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) {
+        const parsed = normalizeData(JSON.parse(saved));
+        if (datasetScore(parsed) >= datasetScore(best)) {
+          best = parsed;
+        }
+      }
+    } catch {}
+
+    // If running inside AI Studio with legacy PostgreSQL backend, pull richer state once
+    try {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 2500);
+      const res = await fetch('/api/data', { signal: controller.signal });
+      window.clearTimeout(timeout);
+      const ct = res.headers.get('content-type') || '';
+      if (res.ok && ct.includes('application/json')) {
+        const json = await res.json();
+        if (json?.data) {
+          const remote = normalizeData(json.data);
+          if (datasetScore(remote) > datasetScore(best)) {
+            best = remote;
+          }
+        }
+      }
+    } catch {
+      // Expected on Vercel / static hosting where /api/data does not exist
+    }
+
+    return best;
+  };
+
+  // Save data mirror to localStorage
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
     } catch (e) {
       console.error('Error saving data to localStorage', e);
     }
+  }, [data]);
 
-    // Do NOT push unhydrated state back to PostgreSQL on initial render
-    if (!isHydratedRef.current) {
+  // Firestore Auth Gate + Seed + Real-Time Listener
+  useEffect(() => {
+    if (authLoading) {
+      setAccessStatus('loading');
       return;
     }
 
-    // Debounced background sync to Cloud SQL PostgreSQL
-    const syncTimer = setTimeout(() => {
-      fetch('/api/data', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ appData: data }),
-      }).catch((err) => {
-        // Silently handle offline/network deviations
-      });
-    }, 1200);
+    if (!user || !user.email) {
+      setAccessStatus('unauthenticated');
+      setCurrentUserRole(null);
+      setIsFirestoreReady(false);
+      return;
+    }
 
-    return () => clearTimeout(syncTimer);
-  }, [data]);
-
-  // Initial load from Cloud SQL PostgreSQL to ensure multi-device synchronization
-  useEffect(() => {
     let isMounted = true;
-    async function hydrateFromPostgres() {
+    let unsubscribe: (() => void) | null = null;
+    let retryTimer: number | null = null;
+    const userEmail = user.email.trim().toLowerCase();
+    const isAdminUser = isPrimaryAdminEmail(userEmail);
+
+    const isOfflineOrNetworkError = (err: unknown): boolean => {
+      const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+      return (
+        msg.includes('client is offline') ||
+        msg.includes('unavailable') ||
+        msg.includes('could not reach') ||
+        msg.includes('network') ||
+        msg.includes('timeout')
+      );
+    };
+
+    const attachRealtimeListeners = () => {
+      if (unsubscribe || !isMounted) return;
+      unsubscribe = subscribeToFirestoreData(userEmail, isAdminUser, (patch) => {
+        if (!isMounted) return;
+        setData((prev) => {
+          const merged = normalizeData({ ...prev, ...patch });
+          dataRef.current = merged;
+          return merged;
+        });
+        const now = new Date();
+        setLastCloudSync(now);
+        try {
+          localStorage.setItem('dulceria_tatao_last_sync', now.toISOString());
+        } catch {}
+        setIsFirestoreReady(true);
+      });
+    };
+
+    async function initFirestoreSession() {
+      setAccessStatus('loading');
+      setIsSyncing(true);
       try {
-        const res = await fetch('/api/data');
-        if (res.ok) {
-          const result = await res.json();
-          if (result && result.data && isMounted) {
-            const remoteData = normalizeData(result.data);
-            const init = initialJson as unknown as AppData;
+        const access = await checkUserAccess(userEmail);
+        if (!isMounted) return;
 
-            // Intelligently select whichever dataset is richer/newer
-            const initVentas = init.ventas?.length || 0;
-            const remoteVentas = remoteData.ventas?.length || 0;
-            const currentVentas = data.ventas?.length || 0;
+        if (!access.authorized || !access.rol) {
+          setAccessStatus('denied');
+          setCurrentUserRole(null);
+          setIsFirestoreReady(false);
+          setIsSyncing(false);
+          return;
+        }
 
-            let chosen = remoteData;
-            if (initVentas > remoteVentas && initVentas >= currentVentas) {
-              chosen = normalizeData(init);
-              // Update remote with richer init dataset
-              fetch('/api/data', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ appData: chosen }),
-              }).catch(() => {});
-            }
+        setCurrentUserRole(access.rol);
+        setAccessStatus('authorized');
 
-            setData(chosen);
-            try {
-              localStorage.setItem(STORAGE_KEY, JSON.stringify(chosen));
-            } catch {}
-
-            const syncDate = new Date();
-            setLastCloudSync(syncDate);
-            try {
-              localStorage.setItem('dulceria_tatao_last_sync', syncDate.toISOString());
-            } catch {}
-          } else if (result && !result.data) {
-            // Seed PostgreSQL with current data on first run
-            await fetch('/api/data', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ appData: data }),
-            });
+        if (isAdminUser) {
+          const seedResult = await seedFirestoreIfNeeded(gatherBestInitialDataset, userEmail);
+          if (seedResult.seeded && isMounted) {
+            showToast('success', 'Base de datos migrada y sincronizada en Firebase Firestore.');
           }
         }
+
+        if (!isMounted) return;
+        attachRealtimeListeners();
       } catch (err) {
-        // Fall back gracefully to localStorage
+        if (!isMounted) return;
+        console.error('Error initializing Firestore session:', err);
+
+        if (isOfflineOrNetworkError(err)) {
+          setIsFirestoreReady(false);
+          showToast(
+            'error',
+            'Sin respuesta de Firestore (modo local activo). Reintentando conexión automáticamente...',
+            7000
+          );
+          attachRealtimeListeners();
+          if (retryTimer === null) {
+            retryTimer = window.setTimeout(() => {
+              retryTimer = null;
+              if (isMounted && isAdminUser) {
+                seedFirestoreIfNeeded(gatherBestInitialDataset, userEmail)
+                  .then((res) => {
+                    if (res.seeded && isMounted) {
+                      showToast('success', 'Base de datos sincronizada con Firebase Firestore.');
+                    }
+                  })
+                  .catch(() => {});
+              }
+            }, 8000);
+          }
+        } else {
+          setFatalError(err instanceof Error ? err : new Error(String(err)));
+        }
       } finally {
-        isHydratedRef.current = true;
+        if (isMounted) setIsSyncing(false);
       }
     }
-    hydrateFromPostgres();
+
+    initFirestoreSession();
+
+    const handleOnline = () => {
+      if (isMounted && isAdminUser) {
+        seedFirestoreIfNeeded(gatherBestInitialDataset, userEmail)
+          .then((res) => {
+            if (res.seeded && isMounted) {
+              showToast('success', 'Conexión restaurada: datos sincronizados con Firestore.');
+            }
+          })
+          .catch(() => {});
+      }
+    };
+    window.addEventListener('online', handleOnline);
+
     return () => {
       isMounted = false;
+      window.removeEventListener('online', handleOnline);
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+      if (unsubscribe) unsubscribe();
     };
-  }, []);
+  }, [authLoading, user]);
 
-  // Sync with Cloud SQL PostgreSQL: pull or push
+  // Manual Sync with Firestore (pull fresh from server or push current local dataset)
   const syncWithCloud = async (
     mode: 'pull' | 'push' = 'pull'
   ): Promise<{ success: boolean; message: string }> => {
+    if (!user?.email) {
+      return { success: false, message: 'Debes iniciar sesión con Google para sincronizar.' };
+    }
+    const userEmail = user.email.trim().toLowerCase();
     setIsSyncing(true);
     try {
       if (mode === 'push') {
-        const res = await fetch('/api/data', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ appData: data }),
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await replaceAllFirestoreData(dataRef.current, userEmail);
         const syncDate = new Date();
         setLastCloudSync(syncDate);
         try {
           localStorage.setItem('dulceria_tatao_last_sync', syncDate.toISOString());
         } catch {}
-        const msg = `Datos locales guardados en la nube con éxito a las ${syncDate.toLocaleTimeString('es-CU')}.`;
-        setSyncStatusMessage({ type: 'success', text: msg });
-        setTimeout(() => setSyncStatusMessage(null), 5000);
+        const msg = `Datos guardados en Firebase Firestore a las ${syncDate.toLocaleTimeString('es-CU')}.`;
+        showToast('success', msg, 5000);
         return { success: true, message: msg };
       } else {
-        // Pull latest from Cloud SQL PostgreSQL
-        const res = await fetch('/api/data');
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const result = await res.json();
-        if (result && result.data) {
-          const normalized = normalizeData(result.data);
-          setData(normalized);
-          try {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
-          } catch {}
-          const syncDate = new Date();
-          setLastCloudSync(syncDate);
-          try {
-            localStorage.setItem('dulceria_tatao_last_sync', syncDate.toISOString());
-          } catch {}
-          const vCount = normalized.ventas?.length || 0;
-          const pCount = normalized.produccion?.length || 0;
-          const gCount = normalized.gastos?.length || 0;
-          const msg = `Sincronización con la nube completada: ${vCount} ventas, ${pCount} lotes y ${gCount} gastos al día.`;
-          setSyncStatusMessage({ type: 'success', text: msg });
-          setTimeout(() => setSyncStatusMessage(null), 5000);
-          return { success: true, message: msg };
-        } else {
-          throw new Error('No se encontraron datos remotos en la base de datos');
-        }
+        const fetched = await fetchAllFirestoreFromServer(userEmail, isPrimaryAdminEmail(userEmail));
+        const normalized = normalizeData({ ...dataRef.current, ...fetched });
+        setData(normalized);
+        dataRef.current = normalized;
+        const syncDate = new Date();
+        setLastCloudSync(syncDate);
+        try {
+          localStorage.setItem('dulceria_tatao_last_sync', syncDate.toISOString());
+        } catch {}
+        const vCount = normalized.ventas?.length || 0;
+        const pCount = normalized.produccion?.length || 0;
+        const gCount = normalized.gastos?.length || 0;
+        const msg = `Sincronización en Firestore al día: ${vCount} ventas, ${pCount} lotes y ${gCount} gastos.`;
+        showToast('success', msg, 5000);
+        return { success: true, message: msg };
       }
     } catch (err: any) {
-      const errorMsg = `Error al sincronizar con la nube: ${err.message || 'Error de conexión'}`;
-      setSyncStatusMessage({ type: 'error', text: errorMsg });
-      setTimeout(() => setSyncStatusMessage(null), 6000);
+      const errorMsg = `Error al sincronizar con Firestore: ${err?.message || 'Error de conexión'}`;
+      showToast('error', errorMsg, 6000);
       return { success: false, message: errorMsg };
     } finally {
       setIsSyncing(false);
-      // Reschedule next auto sync for 30 minutes from now
-      setNextAutoSyncTime(Date.now() + 30 * 60 * 1000);
     }
   };
 
-  // Postpone scheduled auto-sync (e.g. 10 minutes)
-  const postponeAutoSync = (minutes = 10) => {
+  const postponeAutoSync = () => {
     setAutoSyncWarning(null);
-    const newTarget = Date.now() + minutes * 60 * 1000;
-    setNextAutoSyncTime(newTarget);
-    setSyncStatusMessage({
-      type: 'info',
-      text: `Sincronización aplazada ${minutes} minutos. Puedes continuar trabajando.`,
-    });
-    setTimeout(() => setSyncStatusMessage(null), 4000);
   };
 
-  // Dismiss auto-sync warning and reset for next 30 min cycle
   const dismissAutoSyncWarning = () => {
     setAutoSyncWarning(null);
-    setNextAutoSyncTime(Date.now() + 30 * 60 * 1000);
   };
 
-  // Manually test advance warning for demo / verification
   const triggerManualAutoSyncTest = () => {
-    setNextAutoSyncTime(Date.now() + 30 * 1000);
-    setAutoSyncWarning({ active: true, secondsLeft: 30 });
+    syncWithCloud('pull');
   };
-
-  // 30-minute Auto-Sync Countdown and Warning logic
-  useEffect(() => {
-    if (!isAutoSyncEnabled) {
-      setAutoSyncWarning(null);
-      return;
-    }
-
-    const interval = setInterval(() => {
-      const now = Date.now();
-      const msRemaining = nextAutoSyncTime - now;
-
-      // 30 seconds before sync: trigger advance warning
-      if (msRemaining <= 30000 && msRemaining > 0) {
-        const secondsLeft = Math.max(1, Math.ceil(msRemaining / 1000));
-        setAutoSyncWarning({ active: true, secondsLeft });
-      } else if (msRemaining <= 0) {
-        // Time to sync!
-        // Safety check: is user actively typing in an input, textarea, or select?
-        const activeTag = document.activeElement?.tagName;
-        const isEditing =
-          activeTag === 'INPUT' || activeTag === 'TEXTAREA' || activeTag === 'SELECT';
-
-        if (isEditing) {
-          // Postpone automatically by 5 minutes to avoid interrupting active typing
-          setNextAutoSyncTime(Date.now() + 5 * 60 * 1000);
-          setAutoSyncWarning(null);
-          setSyncStatusMessage({
-            type: 'info',
-            text: 'Sincronización aplazada 5 minutos para proteger los datos que estás editando.',
-          });
-          setTimeout(() => setSyncStatusMessage(null), 5000);
-        } else {
-          // Smoothly perform auto-sync
-          setAutoSyncWarning(null);
-          setNextAutoSyncTime(Date.now() + 30 * 60 * 1000);
-          syncWithCloud('pull');
-        }
-      } else {
-        // Outside warning window
-        if (autoSyncWarning) {
-          setAutoSyncWarning(null);
-        }
-      }
-    }, 1000);
-
-    return () => clearInterval(interval);
-  }, [isAutoSyncEnabled, nextAutoSyncTime, autoSyncWarning]);
 
   // Reconciliation note
   const [reconciliationNote, setReconciliationNote] = useState<string>(() => {
@@ -582,7 +637,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   // Global Navigation: starts on 'Panel'
   const [currentModule, setCurrentModule] = useState<ModuleName>('Panel');
 
-  // Global Date State: starts on Monday of current week to today
+  // Global Date State
   const defaultRange = useMemo(() => getDefaultDateRange(), []);
   const [fechaDesde, setFechaDesde] = useState<string>(defaultRange.desde);
   const [fechaHasta, setFechaHasta] = useState<string>(defaultRange.hasta);
@@ -597,14 +652,33 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setDateRange(range.desde, range.hasta);
   };
 
+  const getAllowedEmails = () => buildAllowedEmails(dataRef.current.usuariosAutorizados || []);
+
+  const runCloudWrite = (op: Promise<unknown>) => {
+    if (!user?.email) return;
+    op
+      .then(() => {
+        const now = new Date();
+        setLastCloudSync(now);
+        try {
+          localStorage.setItem('dulceria_tatao_last_sync', now.toISOString());
+        } catch {}
+      })
+      .catch((err) => {
+        console.error('Firestore write failed:', err);
+        showToast('error', 'No se pudo guardar el cambio en Firestore. Verifica tu conexión o permisos.', 6000);
+      });
+  };
+
   // ----------------------------------------------------
   // PRODUCCIÓN
   // ----------------------------------------------------
   const addProduccion = (lote: Omit<ProduccionLote, 'id' | 'costo'>) => {
-    const prodObj = data.productos.find((p) => p.nombre === lote.producto);
+    const current = dataRef.current;
+    const prodObj = current.productos.find((p) => p.nombre === lote.producto);
     const precioVigente = prodObj ? getPrecioVigente(prodObj, lote.fecha) : 0;
     const costo = lote.cantidad * precioVigente;
-    const newLoteId = `lote-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
+    const newLoteId = `lote-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
     const newLote: ProduccionLote = {
       ...lote,
@@ -612,8 +686,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       costo,
     };
 
-    // Auto-create salary expense in gastos
-    const pagoUnit = getPagoPorDulce(lote.producto, data.meta);
+    const pagoUnit = getPagoPorDulce(lote.producto, current.meta);
     const importeSalario = lote.cantidad * pagoUnit;
 
     const newSalaryGasto: GastoItem = {
@@ -633,48 +706,55 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       produccion: [newLote, ...prev.produccion],
       gastos: [newSalaryGasto, ...prev.gastos],
     }));
+
+    runCloudWrite(fsSaveProduccionAndGasto(newLote, newSalaryGasto, getAllowedEmails()));
   };
 
   const updateProduccion = (id: string, lote: Partial<ProduccionLote>) => {
-    setData((prev) => {
-      const updatedProduccion = prev.produccion.map((p) => {
-        if (p.id !== id) return p;
-        const merged = { ...p, ...lote };
-        const prodObj = prev.productos.find((prod) => prod.nombre === merged.producto);
-        const precioVigente = prodObj ? getPrecioVigente(prodObj, merged.fecha) : 0;
-        merged.costo = merged.cantidad * precioVigente;
-        return merged;
-      });
+    const current = dataRef.current;
+    const target = current.produccion.find((p) => p.id === id);
+    if (!target) return;
 
-      const targetLote = updatedProduccion.find((p) => p.id === id);
+    const merged: ProduccionLote = { ...target, ...lote };
+    const prodObj = current.productos.find((prod) => prod.nombre === merged.producto);
+    const precioVigente = prodObj ? getPrecioVigente(prodObj, merged.fecha) : 0;
+    merged.costo = merged.cantidad * precioVigente;
 
-      const updatedGastos = prev.gastos.map((g) => {
-        if (g.loteId === id && targetLote) {
-          const pagoUnit = getPagoPorDulce(targetLote.producto, prev.meta);
-          return {
-            ...g,
-            fecha: targetLote.fecha,
-            concepto: `Salario ${targetLote.producto}`,
-            importe: targetLote.cantidad * pagoUnit,
-          };
+    const linkedGasto = current.gastos.find((g) => g.loteId === id);
+    const pagoUnit = getPagoPorDulce(merged.producto, current.meta);
+    const updatedGasto: GastoItem | null = linkedGasto
+      ? {
+          ...linkedGasto,
+          fecha: merged.fecha,
+          concepto: `Salario ${merged.producto}`,
+          importe: merged.cantidad * pagoUnit,
         }
-        return g;
-      });
+      : null;
 
-      return {
-        ...prev,
-        produccion: updatedProduccion,
-        gastos: updatedGastos,
-      };
-    });
+    setData((prev) => ({
+      ...prev,
+      produccion: prev.produccion.map((p) => (p.id === id ? merged : p)),
+      gastos: updatedGasto
+        ? prev.gastos.map((g) => (g.id === updatedGasto.id ? updatedGasto : g))
+        : prev.gastos,
+    }));
+
+    const allowed = getAllowedEmails();
+    if (updatedGasto) {
+      runCloudWrite(fsSaveProduccionAndGasto(merged, updatedGasto, allowed));
+    } else {
+      runCloudWrite(fsSetEntity('produccion', merged, allowed));
+    }
   };
 
   const deleteProduccion = (id: string) => {
+    const linkedGastoIds = dataRef.current.gastos.filter((g) => g.loteId === id).map((g) => g.id);
     setData((prev) => ({
       ...prev,
       produccion: prev.produccion.filter((p) => p.id !== id),
       gastos: prev.gastos.filter((g) => g.loteId !== id),
     }));
+    runCloudWrite(fsDeleteProduccionAndGastos(id, linkedGastoIds));
   };
 
   // ----------------------------------------------------
@@ -682,7 +762,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   // ----------------------------------------------------
   const getNextValeNumber = (): string => {
     let maxInt = 0;
-    data.ventas.forEach((v) => {
+    dataRef.current.ventas.forEach((v) => {
       const match = v.vale.match(/^\d+/);
       if (match) {
         const val = parseInt(match[0], 10);
@@ -691,8 +771,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         }
       }
     });
-    const nextInt = maxInt + 1;
-    return String(nextInt);
+    return String(maxInt + 1);
   };
 
   const addVenta = (venta: Omit<VentaVale, 'id' | 'vale'>) => {
@@ -708,68 +787,44 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       formaPago: venta.formaPago || 'Efectivo',
     };
 
-    const matchingFactura: FacturaItem = {
-      id: `fac-vale-${nextVale}-${newId}`,
-      numero: nextVale,
-      cliente: cleanCliente,
-      telefono: '',
-      ci: '',
-      direccion: '',
-      fecha: newVenta.fecha,
-      periodoVales: newVenta.fecha,
-      valesIncluidos: [newId],
-      valesDetalle: [
-        {
-          vale: nextVale,
-          fecha: newVenta.fecha,
-          detalle: newVenta.lineas.map((l) => `${l.producto} (${l.cantidad})`).join(', '),
-          importe: newVenta.importeTotal,
-        },
-      ],
-      productosConsolidados: newVenta.lineas.map((l) => ({
-        producto: l.producto,
-        cantidad: l.cantidad,
-        precioUnitario: l.cantidad > 0 ? l.importe / l.cantidad : 0,
-        importe: l.importe,
-      })),
-      importeTotal: newVenta.importeTotal,
-      observaciones: `Factura correspondiente al vale ${nextVale}`,
-    };
+    const numericNext = parseInt(nextVale, 10);
+    const nextSiguiente = !isNaN(numericNext) ? numericNext + 1 : dataRef.current.meta.siguienteVale;
 
-    setData((prev) => {
-      const numericNext = parseInt(nextVale, 10);
-      return {
-        ...prev,
-        meta: {
-          ...prev.meta,
-          siguienteVale: !isNaN(numericNext) ? numericNext + 1 : prev.meta.siguienteVale,
-        },
-        ventas: [newVenta, ...prev.ventas],
-        facturas: [matchingFactura, ...(prev.facturas || [])],
-      };
-    });
+    setData((prev) => ({
+      ...prev,
+      meta: {
+        ...prev.meta,
+        siguienteVale: nextSiguiente,
+      },
+      ventas: [newVenta, ...prev.ventas],
+    }));
+
+    runCloudWrite(
+      fsSaveVentaAndNextVale(newVenta, nextSiguiente, getAllowedEmails(), user?.email || undefined)
+    );
   };
 
   const updateVenta = (id: string, patch: Partial<VentaVale>) => {
+    const target = dataRef.current.ventas.find((v) => v.id === id);
+    if (!target) return;
+    const updated: VentaVale = { ...target, ...patch };
+    if (updated.cliente === 'Mostrador / Público general') {
+      updated.cliente = 'Otros';
+    }
+
     setData((prev) => ({
       ...prev,
-      ventas: prev.ventas.map((v) => {
-        if (v.id !== id) return v;
-        const updated = { ...v, ...patch };
-        if (updated.cliente === 'Mostrador / Público general') {
-          updated.cliente = 'Otros';
-        }
-        return updated;
-      }),
+      ventas: prev.ventas.map((v) => (v.id === id ? updated : v)),
     }));
+    runCloudWrite(fsSetEntity('ventas', updated, getAllowedEmails()));
   };
 
   const deleteVenta = (id: string) => {
-    // Note: prompt specifies "no se reutilizan números al eliminar"
     setData((prev) => ({
       ...prev,
       ventas: prev.ventas.filter((v) => v.id !== id),
     }));
+    runCloudWrite(fsDeleteEntity('ventas', id));
   };
 
   // ----------------------------------------------------
@@ -785,20 +840,21 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       ...prev,
       gastos: [newGasto, ...prev.gastos],
     }));
+    runCloudWrite(fsSetEntity('gastos', newGasto, getAllowedEmails()));
   };
 
   const updateGasto = (id: string, patch: Partial<GastoItem>) => {
+    const target = dataRef.current.gastos.find((g) => g.id === id);
+    if (!target) return;
+    const updated: GastoItem = target.generadoPor
+      ? { ...target, fecha: patch.fecha || target.fecha, importe: patch.importe ?? target.importe }
+      : { ...target, ...patch };
+
     setData((prev) => ({
       ...prev,
-      gastos: prev.gastos.map((g) => {
-        if (g.id !== id) return g;
-        // Don't allow changing auto-generated linkage
-        if (g.generadoPor) {
-          return { ...g, fecha: patch.fecha || g.fecha, importe: patch.importe || g.importe };
-        }
-        return { ...g, ...patch };
-      }),
+      gastos: prev.gastos.map((g) => (g.id === id ? updated : g)),
     }));
+    runCloudWrite(fsSetEntity('gastos', updated, getAllowedEmails()));
   };
 
   const deleteGasto = (id: string) => {
@@ -806,116 +862,124 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       ...prev,
       gastos: prev.gastos.filter((g) => g.id !== id),
     }));
+    runCloudWrite(fsDeleteEntity('gastos', id));
   };
 
   // ----------------------------------------------------
   // CAJA & REPARTOS
   // ----------------------------------------------------
   const marcarRepartoPagado = (repartoId: string, fechaPago: string) => {
-    setData((prev) => {
-      const reparto = prev.repartos.find((r) => r.id === repartoId);
-      if (!reparto) return prev;
+    const reparto = dataRef.current.repartos.find((r) => r.id === repartoId);
+    if (!reparto) return;
 
-      const adminExpense: GastoItem = {
-        id: `gst-rep-${repartoId}-adm-${Date.now()}`,
-        fecha: fechaPago,
-        categoria: 'Salarios',
-        concepto: 'Salario Administrador',
-        importe: reparto.administrador,
-        formaPago: 'Efectivo',
-        tipoSalario: 'Administrador',
-        repartoId: repartoId,
-        generadoPor: 'Reparto',
-      };
+    const ts = Date.now();
+    const adminExpense: GastoItem = {
+      id: `gst-rep-${repartoId}-adm-${ts}`,
+      fecha: fechaPago,
+      categoria: 'Salarios',
+      concepto: 'Salario Administrador',
+      importe: reparto.administrador,
+      formaPago: 'Efectivo',
+      tipoSalario: 'Administrador',
+      repartoId,
+      generadoPor: 'Reparto',
+    };
 
-      const tataoExpense: GastoItem = {
-        id: `gst-rep-${repartoId}-tat-${Date.now()}`,
-        fecha: fechaPago,
-        categoria: 'Salarios',
-        concepto: 'Salario Tatao',
-        importe: reparto.tatao,
-        formaPago: 'Efectivo',
-        tipoSalario: 'Dueños',
-        repartoId: repartoId,
-        generadoPor: 'Reparto',
-      };
+    const tataoExpense: GastoItem = {
+      id: `gst-rep-${repartoId}-tat-${ts}`,
+      fecha: fechaPago,
+      categoria: 'Salarios',
+      concepto: 'Salario Tatao',
+      importe: reparto.tatao,
+      formaPago: 'Efectivo',
+      tipoSalario: 'Dueños',
+      repartoId,
+      generadoPor: 'Reparto',
+    };
 
-      const carlosExpense: GastoItem = {
-        id: `gst-rep-${repartoId}-car-${Date.now()}`,
-        fecha: fechaPago,
-        categoria: 'Salarios',
-        concepto: 'Salario Carlos',
-        importe: reparto.carlos,
-        formaPago: 'Efectivo',
-        tipoSalario: 'Dueños',
-        repartoId: repartoId,
-        generadoPor: 'Reparto',
-      };
+    const carlosExpense: GastoItem = {
+      id: `gst-rep-${repartoId}-car-${ts}`,
+      fecha: fechaPago,
+      categoria: 'Salarios',
+      concepto: 'Salario Carlos',
+      importe: reparto.carlos,
+      formaPago: 'Efectivo',
+      tipoSalario: 'Dueños',
+      repartoId,
+      generadoPor: 'Reparto',
+    };
 
-      const updatedRepartos = prev.repartos.map((r) =>
-        r.id === repartoId ? { ...r, estado: 'Pagado' as const, fechaPago } : r
-      );
+    const updatedReparto: RepartoSemanal = { ...reparto, estado: 'Pagado', fechaPago };
 
-      return {
-        ...prev,
-        repartos: updatedRepartos,
-        gastos: [adminExpense, tataoExpense, carlosExpense, ...prev.gastos],
-      };
-    });
+    setData((prev) => ({
+      ...prev,
+      repartos: prev.repartos.map((r) => (r.id === repartoId ? updatedReparto : r)),
+      gastos: [adminExpense, tataoExpense, carlosExpense, ...prev.gastos],
+    }));
+
+    runCloudWrite(
+      fsSaveRepartoPagado(updatedReparto, [adminExpense, tataoExpense, carlosExpense], getAllowedEmails())
+    );
   };
 
   const deshacerRepartoPagado = (repartoId: string) => {
-    setData((prev) => {
-      const updatedRepartos = prev.repartos.map((r) =>
-        r.id === repartoId ? { ...r, estado: 'Pendiente' as const, fechaPago: null } : r
-      );
-      const filteredGastos = prev.gastos.filter((g) => g.repartoId !== repartoId);
-      return {
-        ...prev,
-        repartos: updatedRepartos,
-        gastos: filteredGastos,
-      };
-    });
+    const reparto = dataRef.current.repartos.find((r) => r.id === repartoId);
+    if (!reparto) return;
+    const updatedReparto: RepartoSemanal = { ...reparto, estado: 'Pendiente', fechaPago: null };
+    const linkedGastoIds = dataRef.current.gastos.filter((g) => g.repartoId === repartoId).map((g) => g.id);
+
+    setData((prev) => ({
+      ...prev,
+      repartos: prev.repartos.map((r) => (r.id === repartoId ? updatedReparto : r)),
+      gastos: prev.gastos.filter((g) => g.repartoId !== repartoId),
+    }));
+
+    runCloudWrite(fsDeshacerRepartoPagado(updatedReparto, linkedGastoIds, getAllowedEmails()));
   };
 
   const updateReglasReparto = (fondoPct: number, administradorPct: number, duenos: string[]) => {
-    setData((prev) => {
-      const newMeta = {
-        ...prev.meta,
-        reparto: {
-          fondoPct,
-          administradorPct,
-          duenos,
-        },
-      };
+    const current = dataRef.current;
+    const newMeta: MetaConfig = {
+      ...current.meta,
+      reparto: { fondoPct, administradorPct, duenos },
+    };
 
-      // Recalculate pending weekly repartos
-      const updatedRepartos = prev.repartos.map((r) => {
-        if (r.estado === 'Pendiente') {
-          const calc = calculateReparto(r.ganancia, fondoPct, administradorPct, duenos.length);
-          return {
-            ...r,
-            administrador: calc.administrador,
-            tatao: calc.cadaDueno,
-            carlos: calc.cadaDueno,
-          };
-        }
-        return r;
-      });
-
-      return {
-        ...prev,
-        meta: newMeta,
-        repartos: updatedRepartos,
-      };
+    const updatedPending: RepartoSemanal[] = [];
+    const updatedRepartos = current.repartos.map((r) => {
+      if (r.estado === 'Pendiente') {
+        const calc = calculateReparto(r.ganancia, fondoPct, administradorPct, duenos.length);
+        const upd = {
+          ...r,
+          administrador: calc.administrador,
+          tatao: calc.cadaDueno,
+          carlos: calc.cadaDueno,
+        };
+        updatedPending.push(upd);
+        return upd;
+      }
+      return r;
     });
+
+    setData((prev) => ({
+      ...prev,
+      meta: newMeta,
+      repartos: updatedRepartos,
+    }));
+
+    runCloudWrite(fsSaveReglasReparto(newMeta, updatedPending, getAllowedEmails(), user?.email || undefined));
   };
 
   // ----------------------------------------------------
   // ALMACÉN
   // ----------------------------------------------------
   const addAlmacenItem = (item: Omit<AlmacenItem, 'id' | 'codigo' | 'movimientos'>) => {
-    const nextNum = data.almacen.length + 1;
+    const currentAlmacen = dataRef.current.almacen;
+    const maxNum = currentAlmacen.reduce((max, a) => {
+      const match = /^MP-(\d+)$/i.exec(a.codigo || '');
+      const n = match ? parseInt(match[1], 10) : 0;
+      return n > max ? n : max;
+    }, currentAlmacen.length);
+    const nextNum = maxNum + 1;
     const codigo = `MP-${String(nextNum).padStart(4, '0')}`;
     const newId = `alm-${Date.now()}`;
 
@@ -940,13 +1004,20 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       ...prev,
       almacen: [newItem, ...prev.almacen],
     }));
+
+    runCloudWrite(fsSetEntity('almacen', newItem, getAllowedEmails()));
   };
 
   const updateAlmacenItem = (id: string, patch: Partial<AlmacenItem>) => {
+    const target = dataRef.current.almacen.find((a) => a.id === id);
+    if (!target) return;
+    const updated = { ...target, ...patch };
+
     setData((prev) => ({
       ...prev,
-      almacen: prev.almacen.map((a) => (a.id === id ? { ...a, ...patch } : a)),
+      almacen: prev.almacen.map((a) => (a.id === id ? updated : a)),
     }));
+    runCloudWrite(fsSetEntity('almacen', updated, getAllowedEmails()));
   };
 
   const deleteAlmacenItem = (id: string) => {
@@ -954,6 +1025,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       ...prev,
       almacen: prev.almacen.filter((a) => a.id !== id),
     }));
+    runCloudWrite(fsDeleteEntity('almacen', id));
   };
 
   const addMovimientoAlmacen = (
@@ -964,56 +1036,57 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     comprobante = '',
     fecha?: string
   ) => {
+    const item = dataRef.current.almacen.find((a) => a.id === itemId);
+    if (!item) return;
+
+    const newStock =
+      tipo === 'Entrada' ? item.existencia + cantidad : Math.max(0, item.existencia - cantidad);
+
+    const newMov = {
+      id: `mov-${Date.now()}`,
+      fecha: fecha || new Date().toISOString().slice(0, 10),
+      tipo,
+      cantidad,
+      saldoResultante: newStock,
+      concepto,
+      comprobante,
+    };
+
+    const updatedItem: AlmacenItem = {
+      ...item,
+      existencia: newStock,
+      movimientos: [newMov, ...item.movimientos],
+    };
+
     setData((prev) => ({
       ...prev,
-      almacen: prev.almacen.map((item) => {
-        if (item.id !== itemId) return item;
-
-        const newStock =
-          tipo === 'Entrada'
-            ? item.existencia + cantidad
-            : Math.max(0, item.existencia - cantidad);
-
-        const newMov = {
-          id: `mov-${Date.now()}`,
-          fecha: fecha || new Date().toISOString().slice(0, 10),
-          tipo,
-          cantidad,
-          saldoResultante: newStock,
-          concepto,
-          comprobante,
-        };
-
-        return {
-          ...item,
-          existencia: newStock,
-          movimientos: [newMov, ...item.movimientos],
-        };
-      }),
+      almacen: prev.almacen.map((a) => (a.id === itemId ? updatedItem : a)),
     }));
+    runCloudWrite(fsSetEntity('almacen', updatedItem, getAllowedEmails()));
   };
 
   const revertirMovimientoAlmacen = (itemId: string, movId: string) => {
+    const item = dataRef.current.almacen.find((a) => a.id === itemId);
+    if (!item) return;
+    const targetMov = item.movimientos.find((m) => m.id === movId);
+    if (!targetMov) return;
+
+    const newStock =
+      targetMov.tipo === 'Entrada'
+        ? Math.max(0, item.existencia - targetMov.cantidad)
+        : item.existencia + targetMov.cantidad;
+
+    const updatedItem: AlmacenItem = {
+      ...item,
+      existencia: newStock,
+      movimientos: item.movimientos.filter((m) => m.id !== movId),
+    };
+
     setData((prev) => ({
       ...prev,
-      almacen: prev.almacen.map((item) => {
-        if (item.id !== itemId) return item;
-        const targetMov = item.movimientos.find((m) => m.id === movId);
-        if (!targetMov) return item;
-
-        // Revert stock impact
-        const newStock =
-          targetMov.tipo === 'Entrada'
-            ? Math.max(0, item.existencia - targetMov.cantidad)
-            : item.existencia + targetMov.cantidad;
-
-        return {
-          ...item,
-          existencia: newStock,
-          movimientos: item.movimientos.filter((m) => m.id !== movId),
-        };
-      }),
+      almacen: prev.almacen.map((a) => (a.id === itemId ? updatedItem : a)),
     }));
+    runCloudWrite(fsSetEntity('almacen', updatedItem, getAllowedEmails()));
   };
 
   // ----------------------------------------------------
@@ -1031,39 +1104,41 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       ...prev,
       clientes: [...prev.clientes, newCliente],
     }));
+    runCloudWrite(fsSetEntity('clientes', newCliente, getAllowedEmails()));
   };
 
   const updateCliente = (id: string, patch: Partial<Cliente>) => {
-    setData((prev) => {
-      const target = prev.clientes.find((c) => c.id === id);
-      const oldName = target?.nombre;
-      const nextRawName = patch.nombre ?? oldName ?? '';
-      const cleanNewName =
-        nextRawName === 'Mostrador / Público general' ? 'Otros' : nextRawName;
+    const current = dataRef.current;
+    const target = current.clientes.find((c) => c.id === id);
+    if (!target) return;
 
-      const updatedClientes = prev.clientes.map((c) => {
-        if (c.id !== id) return c;
-        const merged = { ...c, ...patch };
-        if (merged.nombre === 'Mostrador / Público general') {
-          merged.nombre = 'Otros';
-        }
-        return merged;
-      });
+    const oldName = target.nombre;
+    const nextRawName = patch.nombre ?? oldName ?? '';
+    const cleanNewName = nextRawName === 'Mostrador / Público general' ? 'Otros' : nextRawName;
+    const updatedCli: Cliente = { ...target, ...patch, nombre: cleanNewName };
 
-      const shouldRenameRefs = oldName && cleanNewName && oldName !== cleanNewName;
-      return {
-        ...prev,
-        clientes: updatedClientes,
-        ventas: shouldRenameRefs
-          ? prev.ventas.map((v) => (v.cliente === oldName ? { ...v, cliente: cleanNewName } : v))
-          : prev.ventas,
-        facturas: shouldRenameRefs
-          ? (prev.facturas || []).map((f) =>
-              f.cliente === oldName ? { ...f, cliente: cleanNewName } : f
-            )
-          : prev.facturas,
-      };
-    });
+    const shouldRenameRefs = Boolean(oldName && cleanNewName && oldName !== cleanNewName);
+    const affectedVentas = shouldRenameRefs
+      ? current.ventas.filter((v) => v.cliente === oldName).map((v) => ({ ...v, cliente: cleanNewName }))
+      : [];
+    const affectedFacturas = shouldRenameRefs
+      ? (current.facturas || [])
+          .filter((f) => f.cliente === oldName)
+          .map((f) => ({ ...f, cliente: cleanNewName }))
+      : [];
+
+    setData((prev) => ({
+      ...prev,
+      clientes: prev.clientes.map((c) => (c.id === id ? updatedCli : c)),
+      ventas: shouldRenameRefs
+        ? prev.ventas.map((v) => (v.cliente === oldName ? { ...v, cliente: cleanNewName } : v))
+        : prev.ventas,
+      facturas: shouldRenameRefs
+        ? (prev.facturas || []).map((f) => (f.cliente === oldName ? { ...f, cliente: cleanNewName } : f))
+        : prev.facturas,
+    }));
+
+    runCloudWrite(fsSaveClienteAndRefs(updatedCli, affectedVentas, affectedFacturas, getAllowedEmails()));
   };
 
   const deleteCliente = (id: string) => {
@@ -1071,6 +1146,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       ...prev,
       clientes: prev.clientes.filter((c) => c.id !== id),
     }));
+    runCloudWrite(fsDeleteEntity('clientes', id));
   };
 
   // ----------------------------------------------------
@@ -1102,13 +1178,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       ...prev,
       productos: [...prev.productos, newProd],
     }));
+    runCloudWrite(fsSetEntity('productos', newProd, getAllowedEmails()));
   };
 
   const updateProductoActivo = (id: string, activo: boolean) => {
+    const target = dataRef.current.productos.find((p) => p.id === id);
+    if (!target) return;
+    const updated = { ...target, activo };
     setData((prev) => ({
       ...prev,
-      productos: prev.productos.map((p) => (p.id === id ? { ...p, activo } : p)),
+      productos: prev.productos.map((p) => (p.id === id ? updated : p)),
     }));
+    runCloudWrite(fsSetEntity('productos', updated, getAllowedEmails()));
   };
 
   const updatePrecioProducto = (
@@ -1117,46 +1198,47 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     fechaInicio: string,
     vigenteHasta: string | null = null
   ) => {
+    const prod = dataRef.current.productos.find((p) => p.id === id);
+    if (!prod) return;
+
+    const startDate = new Date(fechaInicio + 'T12:00:00');
+    startDate.setDate(startDate.getDate() - 1);
+    const y = startDate.getFullYear();
+    const m = String(startDate.getMonth() + 1).padStart(2, '0');
+    const d = String(startDate.getDate()).padStart(2, '0');
+    const dayBefore = `${y}-${m}-${d}`;
+
+    const updatedHistory = prod.historicoPrecios.map((h) =>
+      h.hasta === null ? { ...h, hasta: dayBefore } : h
+    );
+    updatedHistory.push({
+      precio: nuevoPrecio,
+      desde: fechaInicio,
+      hasta: vigenteHasta || null,
+    });
+
+    const updatedProd: Producto = {
+      ...prod,
+      precioVigente: nuevoPrecio,
+      historicoPrecios: updatedHistory,
+    };
+
     setData((prev) => ({
       ...prev,
-      productos: prev.productos.map((prod) => {
-        if (prod.id !== id) return prod;
-
-        // Calculate day before fechaInicio for previous hasta
-        const startDate = new Date(fechaInicio + 'T12:00:00');
-        startDate.setDate(startDate.getDate() - 1);
-        const y = startDate.getFullYear();
-        const m = String(startDate.getMonth() + 1).padStart(2, '0');
-        const d = String(startDate.getDate()).padStart(2, '0');
-        const dayBefore = `${y}-${m}-${d}`;
-
-        const updatedHistory = prod.historicoPrecios.map((h) => {
-          if (h.hasta === null) {
-            return { ...h, hasta: dayBefore };
-          }
-          return h;
-        });
-
-        updatedHistory.push({
-          precio: nuevoPrecio,
-          desde: fechaInicio,
-          hasta: vigenteHasta || null,
-        });
-
-        return {
-          ...prod,
-          precioVigente: nuevoPrecio,
-          historicoPrecios: updatedHistory,
-        };
-      }),
+      productos: prev.productos.map((p) => (p.id === id ? updatedProd : p)),
     }));
+    runCloudWrite(fsSetEntity('productos', updatedProd, getAllowedEmails()));
   };
 
   const updateCostoUnitario = (id: string, costoUnitario: number | null) => {
+    const target = dataRef.current.productos.find((p) => p.id === id);
+    if (!target) return;
+    const updated = { ...target, costoUnitario };
     setData((prev) => ({
       ...prev,
-      productos: prev.productos.map((p) => (p.id === id ? { ...p, costoUnitario } : p)),
+      productos: prev.productos.map((p) => (p.id === id ? updated : p)),
     }));
+    runCloudWrite(fsSetEntity('productos', updated, getAllowedEmails()));
   };
 
   const updateParametrosProducto = (
@@ -1165,35 +1247,35 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     gananciaUnidad: number,
     desde: string
   ) => {
-    setData((prev) => {
-      const newPagos = {
-        ...prev.meta.pagoPorDulceTrabajador,
-        [productoNombre]: pagoTrabajador,
-      };
+    const current = dataRef.current;
+    const newPagos = {
+      ...current.meta.pagoPorDulceTrabajador,
+      [productoNombre]: pagoTrabajador,
+    };
+    const existingGanancias = current.meta.gananciaPorUnidad || [];
+    const newGananciaEntry = {
+      producto: productoNombre,
+      desde,
+      valor: productoNombre === 'Masas' ? 0 : gananciaUnidad,
+    };
+    const newMeta: MetaConfig = {
+      ...current.meta,
+      pagoPorDulceTrabajador: newPagos,
+      gananciaPorUnidad: [...existingGanancias, newGananciaEntry],
+    };
 
-      const existingGanancias = prev.meta.gananciaPorUnidad || [];
-      const newGananciaEntry = {
-        producto: productoNombre,
-        desde,
-        valor: productoNombre === 'Masas' ? 0 : gananciaUnidad,
-      };
-
-      return {
-        ...prev,
-        meta: {
-          ...prev.meta,
-          pagoPorDulceTrabajador: newPagos,
-          gananciaPorUnidad: [...existingGanancias, newGananciaEntry],
-        },
-      };
-    });
+    setData((prev) => ({
+      ...prev,
+      meta: newMeta,
+    }));
+    runCloudWrite(fsSaveConfigMeta(newMeta, getAllowedEmails(), user?.email || undefined));
   };
 
   // ----------------------------------------------------
   // FACTURAS
   // ----------------------------------------------------
   const getNextFacturaNumber = (): string => {
-    const list = data.facturas || [];
+    const list = dataRef.current.facturas || [];
     let max = 0;
     list.forEach((f) => {
       const match = f.numero.match(/FAC-(\d+)/);
@@ -1215,6 +1297,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       ...prev,
       facturas: [newFactura, ...(prev.facturas || [])],
     }));
+    runCloudWrite(fsSetEntity('facturas', newFactura, getAllowedEmails()));
   };
 
   const deleteFactura = (id: string) => {
@@ -1222,6 +1305,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       ...prev,
       facturas: (prev.facturas || []).filter((f) => f.id !== id),
     }));
+    runCloudWrite(fsDeleteEntity('facturas', id));
   };
 
   // ----------------------------------------------------
@@ -1237,52 +1321,55 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       fechaRegistro: new Date().toISOString(),
     };
 
-    setData((prev) => {
-      const existing = prev.justificaciones || [];
-      const filtered = existing.filter(
-        (j) => !(j.fecha === fecha && (j.producto || '') === (producto || ''))
-      );
-      const updated = [newJust, ...filtered];
-      try {
-        localStorage.setItem('dulceria_tatao_justificaciones', JSON.stringify(updated));
-      } catch (e) {
-        console.error('Error saving justificaciones', e);
-      }
-      return {
-        ...prev,
-        justificaciones: updated,
-      };
-    });
+    const existing = dataRef.current.justificaciones || [];
+    const replacedIds = existing
+      .filter((j) => j.fecha === fecha && (j.producto || '') === (producto || ''))
+      .map((j) => j.id);
+    const updated = [
+      newJust,
+      ...existing.filter((j) => !(j.fecha === fecha && (j.producto || '') === (producto || ''))),
+    ];
+
+    try {
+      localStorage.setItem('dulceria_tatao_justificaciones', JSON.stringify(updated));
+    } catch {}
+
+    setData((prev) => ({
+      ...prev,
+      justificaciones: updated,
+    }));
+
+    const allowed = getAllowedEmails();
+    runCloudWrite(
+      Promise.all([
+        fsSetEntity('justificaciones', newJust, allowed),
+        ...replacedIds.map((rid) => fsDeleteEntity('justificaciones', rid)),
+      ])
+    );
   };
 
   const updateJustificacion = (id: string, nota: string) => {
-    setData((prev) => {
-      const updated = (prev.justificaciones || []).map((j) =>
-        j.id === id ? { ...j, nota, fechaRegistro: new Date().toISOString() } : j
-      );
-      try {
-        localStorage.setItem('dulceria_tatao_justificaciones', JSON.stringify(updated));
-      } catch (e) {
-        console.error('Error updating justificaciones', e);
-      }
-      return { ...prev, justificaciones: updated };
-    });
+    const target = (dataRef.current.justificaciones || []).find((j) => j.id === id);
+    if (!target) return;
+    const updatedJust = { ...target, nota, fechaRegistro: new Date().toISOString() };
+    const updated = (dataRef.current.justificaciones || []).map((j) => (j.id === id ? updatedJust : j));
+
+    try {
+      localStorage.setItem('dulceria_tatao_justificaciones', JSON.stringify(updated));
+    } catch {}
+
+    setData((prev) => ({ ...prev, justificaciones: updated }));
+    runCloudWrite(fsSetEntity('justificaciones', updatedJust, getAllowedEmails()));
   };
 
   const deleteJustificacion = (id: string) => {
-    setData((prev) => {
-      const updated = (prev.justificaciones || []).filter((j) => j.id !== id);
-      try {
-        localStorage.setItem('dulceria_tatao_justificaciones', JSON.stringify(updated));
-      } catch (e) {
-        console.error('Error deleting justificacion', e);
-      }
-      return { ...prev, justificaciones: updated };
-    });
+    const updated = (dataRef.current.justificaciones || []).filter((j) => j.id !== id);
+    try {
+      localStorage.setItem('dulceria_tatao_justificaciones', JSON.stringify(updated));
+    } catch {}
+    setData((prev) => ({ ...prev, justificaciones: updated }));
+    runCloudWrite(fsDeleteEntity('justificaciones', id));
   };
-
-
-  // Submenú 1: Materiales (Gestión manual no soportada, se sincroniza con Almacén)
 
   // ----------------------------------------------------
   // SUBMENÚ 2: RECETAS
@@ -1298,15 +1385,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       ...prev,
       recetas: [newRec, ...(prev.recetas || [])],
     }));
+    runCloudWrite(fsSetEntity('recetas', newRec, getAllowedEmails()));
   };
 
   const updateReceta = (id: string, patch: Partial<Receta>) => {
+    const target = (dataRef.current.recetas || []).find((r) => r.id === id);
+    if (!target) return;
+    const updated = { ...target, ...patch };
     setData((prev) => ({
       ...prev,
-      recetas: (prev.recetas || []).map((r) =>
-        r.id === id ? { ...r, ...patch } : r
-      ),
+      recetas: (prev.recetas || []).map((r) => (r.id === id ? updated : r)),
     }));
+    runCloudWrite(fsSetEntity('recetas', updated, getAllowedEmails()));
   };
 
   const deleteReceta = (id: string) => {
@@ -1314,6 +1404,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       ...prev,
       recetas: (prev.recetas || []).filter((r) => r.id !== id),
     }));
+    runCloudWrite(fsDeleteEntity('recetas', id));
   };
 
   // ----------------------------------------------------
@@ -1323,36 +1414,52 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const newId = `usr-${Date.now()}`;
     const newUsr: UsuarioAutorizado = {
       ...usr,
+      email: usr.email.trim().toLowerCase(),
       id: newId,
       fechaAgregado: new Date().toISOString().slice(0, 10),
     };
+    const nextList = [...(dataRef.current.usuariosAutorizados || []), newUsr];
     setData((prev) => ({
       ...prev,
-      usuariosAutorizados: [...(prev.usuariosAutorizados || []), newUsr],
+      usuariosAutorizados: nextList,
     }));
+    runCloudWrite(fsSaveUsuarioAndSyncAllowedEmails('upsert', newUsr, nextList));
   };
 
   const updateUsuarioAutorizado = (id: string, patch: Partial<UsuarioAutorizado>) => {
+    const currentList = dataRef.current.usuariosAutorizados || [];
+    const target = currentList.find((u) => u.id === id);
+    if (!target) return;
+    const updatedUsr: UsuarioAutorizado = {
+      ...target,
+      ...patch,
+      email: (patch.email ?? target.email).trim().toLowerCase(),
+    };
+    const nextList = currentList.map((u) => (u.id === id ? updatedUsr : u));
     setData((prev) => ({
       ...prev,
-      usuariosAutorizados: (prev.usuariosAutorizados || []).map((u) =>
-        u.id === id ? { ...u, ...patch } : u
-      ),
+      usuariosAutorizados: nextList,
     }));
+    runCloudWrite(fsSaveUsuarioAndSyncAllowedEmails('upsert', updatedUsr, nextList));
   };
 
   const deleteUsuarioAutorizado = (id: string) => {
+    const currentList = dataRef.current.usuariosAutorizados || [];
+    const target = currentList.find((u) => u.id === id);
+    if (!target) return;
+    const nextList = currentList.filter((u) => u.id !== id);
     setData((prev) => ({
       ...prev,
-      usuariosAutorizados: (prev.usuariosAutorizados || []).filter((u) => u.id !== id),
+      usuariosAutorizados: nextList,
     }));
+    runCloudWrite(fsSaveUsuarioAndSyncAllowedEmails('delete', target, nextList));
   };
 
-  // Exportar respaldo de datos compatible con localStorage y Vercel
+  // Exportar respaldo de datos compatible con localStorage
   const exportBackup = () => {
     try {
       const dump: Record<string, string> = {
-        [STORAGE_KEY]: JSON.stringify(data),
+        [STORAGE_KEY]: JSON.stringify(dataRef.current),
       };
       const blob = new Blob([JSON.stringify(dump, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
@@ -1366,7 +1473,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   };
 
-  // Importar y aplicar respaldo de datos
+  // Importar y aplicar respaldo de datos directo a Firestore
   const importBackup = (backupContent: string): boolean => {
     try {
       const parsed = JSON.parse(backupContent);
@@ -1374,9 +1481,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
       if (parsed && typeof parsed === 'object') {
         if (parsed[STORAGE_KEY]) {
-          targetData = typeof parsed[STORAGE_KEY] === 'string'
-            ? JSON.parse(parsed[STORAGE_KEY])
-            : parsed[STORAGE_KEY];
+          targetData =
+            typeof parsed[STORAGE_KEY] === 'string'
+              ? JSON.parse(parsed[STORAGE_KEY])
+              : parsed[STORAGE_KEY];
         } else if (parsed.meta && parsed.ventas) {
           targetData = parsed;
         }
@@ -1385,18 +1493,30 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       if (targetData) {
         const normalized = normalizeData(targetData);
         setData(normalized);
+        dataRef.current = normalized;
         try {
           localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
         } catch (e) {
           console.error('Error guardando en localStorage', e);
         }
 
-        // Sincronizar de inmediato con PostgreSQL
-        fetch('/api/data', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ appData: normalized }),
-        }).catch((err) => console.warn('Could not sync imported backup to Cloud SQL:', err));
+        if (user?.email) {
+          setIsSyncing(true);
+          replaceAllFirestoreData(normalized, user.email.trim().toLowerCase())
+            .then(() => {
+              const now = new Date();
+              setLastCloudSync(now);
+              try {
+                localStorage.setItem('dulceria_tatao_last_sync', now.toISOString());
+              } catch {}
+              showToast('success', 'Respaldo importado y subido a Firebase Firestore.');
+            })
+            .catch((err) => {
+              console.error('Error syncing imported backup to Firestore:', err);
+              showToast('error', 'El respaldo se cargó localmente pero falló la subida a Firestore.', 6000);
+            })
+            .finally(() => setIsSyncing(false));
+        }
 
         return true;
       }
@@ -1417,6 +1537,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return conc.totalPendientes;
   }, [data.produccion, data.ventas, data.justificaciones]);
 
+  // Contador global de repartos semanales pendientes de pago
+  const pendingRepartosCount = useMemo(() => {
+    return (data.repartos || []).filter((r) => r.estado === 'Pendiente').length;
+  }, [data.repartos]);
+
+  // Contador global de recetas con algún material agotado en almacén
+  const outOfStockRecetasCount = useMemo(() => {
+    const recetasList = data.recetas || [];
+    const almacenList = data.almacen || [];
+    return recetasList.filter((rec) => getRecetaAgotados(rec, almacenList, recetasList).length > 0).length;
+  }, [data.recetas, data.almacen]);
+
   const value = {
     data,
     currentModule,
@@ -1428,7 +1560,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     reconciliationNote,
     saveReconciliationNote,
 
+    accessStatus,
+    currentUserRole,
+    isFirestoreReady,
+
     pendingAlertsCount,
+    pendingRepartosCount,
+    outOfStockRecetasCount,
 
     justificaciones: data.justificaciones || [],
     addJustificacion,
@@ -1468,7 +1606,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     updateCostoUnitario,
     updateParametrosProducto,
 
-
     addReceta,
     updateReceta,
     deleteReceta,
@@ -1485,7 +1622,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     importBackup,
     exportBackup,
 
-    // Cloud Sync & Auto-sync
     isSyncing,
     lastCloudSync,
     syncStatusMessage,
