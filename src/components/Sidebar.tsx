@@ -330,8 +330,9 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpenMobile, onCloseMobile })
         </nav>
 
         {/* Sidebar Footer */}
-        <div className="p-3 border-t border-slate-800 text-[10px] text-slate-400 text-center">
-          Dulcería TATAO &copy; 2026
+        <div className="p-3 border-t border-slate-800 text-[10px] text-slate-400 text-center space-y-0.5">
+          <div>Dulcería TATAO &copy; 2026</div>
+          <div className="text-slate-500 font-mono">v. 1.2026.1128</div>
         </div>
       </aside>
     </>
